@@ -23,7 +23,9 @@ permissions:
   packages: write
 
 jobs:
+  # ============================================================================
   # Job 1: 动态版本计算器 (推送到主分支时版本号自动加 0.0.1)
+  # ============================================================================
   version:
     name: Determine Next Release Version (+0.0.1)
     runs-on: ubuntu-latest
@@ -58,19 +60,18 @@ jobs:
             exit 0
           fi
 
-          # 3. 自动计算：拉取已有最新语义化标签 (例如 v1.0.0) 并将 PATCH 版本自动加 1 (+0.0.1)
+          # 3. 自动计算：拉取已有最新语义化标签并自动 +0.0.1
           git fetch --tags --force || true
           LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n 1)
 
           if [ -z "$LATEST_TAG" ]; then
-            # 仓库初始第一次自动发布，默认基准设为 v1.0.0
             LATEST_TAG="v1.0.0"
             echo "No existing release tags found, initializing baseline from ${LATEST_TAG}"
           else
             echo "Found latest existing release tag: ${LATEST_TAG}"
           fi
 
-          # 解析 Major.Minor.Patch
+          # 提取 Major.Minor.Patch 并将 PATCH + 1
           CLEAN_VER="${LATEST_TAG#v}"
           MAJOR=$(echo "$CLEAN_VER" | cut -d. -f1)
           MINOR=$(echo "$CLEAN_VER" | cut -d. -f2)
@@ -80,7 +81,6 @@ jobs:
           MINOR=${MINOR:-0}
           PATCH=${PATCH:-0}
 
-          # 自动递增 0.0.1 (PATCH + 1)
           NEW_PATCH=$((PATCH + 1))
           NEXT_VER="v${MAJOR}.${MINOR}.${NEW_PATCH}"
 
@@ -88,21 +88,25 @@ jobs:
           echo "is_draft=${{ inputs.is_draft || false }}" >> $GITHUB_OUTPUT
           echo "🚀 Next auto-incremented release version (+0.0.1): ${NEXT_VER}"
 
-  # Job 2: 验证与编译 Web 核心静态资产
-  build-web:
-    name: Build Web Applet
+  # ============================================================================
+  # Job 2: 完整构建 Web 资产、打包 Android 原生 APK 并发布 GitHub Release
+  # ============================================================================
+  build-and-release:
+    name: Build & Release Android App
     needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Setup Node.js (v20)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install Dependencies
+      - name: Install Node Dependencies
         run: |
           if [ -f package-lock.json ]; then
             npm ci --legacy-peer-deps || npm install --legacy-peer-deps
@@ -113,46 +117,11 @@ jobs:
       - name: Code Quality & Lint Check
         run: npm run lint
 
-      - name: Build Web Application
+      - name: Build Web Application (Vite Dist)
         run: npm run build
         env:
           VITE_AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'ap-northeast-1' }}
           VITE_CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-
-      - name: Upload Web Build Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-dist
-          path: dist/
-          retention-days: 7
-
-  # Job 3: 构建 Android APK 安装包
-  build-android:
-    name: Build Android APK
-    needs: [version, build-web]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install Dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --legacy-peer-deps || npm install --legacy-peer-deps
-          else
-            npm install --legacy-peer-deps
-          fi
-
-      - name: Download Web Build
-        uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: dist
 
       - name: Setup Java Development Kit (JDK 17)
         uses: actions/setup-java@v4
@@ -160,7 +129,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Accept Android SDK Licenses & Prepare Environment
+      - name: Accept Android SDK Licenses
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=${SDK_ROOT}" >> $GITHUB_ENV
@@ -172,10 +141,8 @@ jobs:
             fi
           fi
 
-      - name: Initialize Capacitor Android Project
+      - name: Sync Web Assets to Android Project
         run: |
-          npm install --save-dev --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
-          npx cap add android || true
           npx cap sync android
 
       - name: Build Android APK with Gradle
@@ -184,7 +151,7 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
 
-      - name: Sign Android Release (If Keystore Provided)
+      - name: Sign Android Release (If Keystore Secret Provided)
         if: env.KEYSTORE_SECRET != ''
         id: sign_app
         continue-on-error: true
@@ -198,16 +165,16 @@ jobs:
           alias: ${{ secrets.ANDROID_KEY_ALIAS || 'lightsail-key' }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      - name: Prepare APK for Release (Ensure Unsigned APK Never Blocked)
+      - name: Prepare APK Release Assets (Guaranteed Non-Blocking)
         id: prepare_apk
         run: |
           mkdir -p release-output
           APP_VER="${{ needs.version.outputs.version }}"
 
-          echo "Scanning build outputs in android/app/build/outputs/apk/..."
-          ls -R android/app/build/outputs/apk/ || true
+          echo "Listing compiled APKs:"
+          find android/app/build/outputs/apk/ -type f -name "*.apk" || true
 
-          # 1. 若配置了密钥且签名成功，发布已签名的正式 APK
+          # 1. 若配置了证书且签名成功，导出已签名的正式安装包
           SIGNED_APK=$(find android/app/build/outputs/apk -name "*signed*.apk" | head -n 1)
           if [ -n "$SIGNED_APK" ]; then
             echo "✓ Found production signed APK: $SIGNED_APK"
@@ -229,45 +196,30 @@ jobs:
           fi
 
           # 4. 汇总检查
-          TOTAL_FILES=$(ls -1 release-output/ 2>/dev/null | wc -l)
-          if [ "$TOTAL_FILES" -eq 0 ]; then
-            echo "⚠️ No APK found, packaging web distribution as fallback"
+          TOTAL_APKS=$(ls -1 release-output/*.apk 2>/dev/null | wc -l)
+          if [ "$TOTAL_APKS" -eq 0 ]; then
+            echo "⚠️ Packaging web distribution as fallback"
             tar -czf "release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" -C dist .
           else
-            echo "🎉 Successfully prepared release assets:"
+            echo "🎉 Successfully prepared $TOTAL_APKS APK(s) for release:"
             ls -lh release-output/
           fi
 
-      - name: Upload APK Artifact
+      - name: Upload Artifacts to Workflow Run
         uses: actions/upload-artifact@v4
         with:
           name: lightsail-manager-apk
           path: release-output/
           retention-days: 30
 
-  # Job 4: 自动发布 GitHub Release 并上传 APK
-  create-release:
-    name: Create GitHub Release
-    needs: [version, build-web, build-android]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Download APK Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: lightsail-manager-apk
-          path: release-assets
-
-      - name: Publish GitHub Release with APK
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.version }}
           name: "Lightsail Manager Android ${{ needs.version.outputs.version }}"
           draft: ${{ needs.version.outputs.is_draft == 'true' }}
           prerelease: false
-          files: release-assets/*
+          files: release-output/*
           body: |
             ### 🚀 AWS Lightsail Manager (Android Edition) ${{ needs.version.outputs.version }}
 
@@ -279,8 +231,8 @@ jobs:
             - **故障排查诊断控制台**：实时 HTTP 调用日志追踪、连通性一键检查与诊断包导出。
 
             #### 📱 安装说明
-            - 下载下方附带的 `.apk` 文件。
-            - 在 Android 手机上打开并允许「安装未知来源应用」即可安装使用。
-            - 首次使用支持内置 **Floci 模拟器** 免费体验，亦可在「设置」中填入真实 AWS 与 Cloudflare 凭证。
+            - **无密钥开箱即装**：下载附件中的 `Lightsail-Manager-${{ needs.version.outputs.version }}.apk`，在 Android 手机上打开即可直接安装使用。
+            - **未签名备用包**：附件中同时提供 `Lightsail-Manager-${{ needs.version.outputs.version }}-unsigned.apk`，方便使用自己的证书重签名。
+            - 若在仓库配置了 `ANDROID_KEYSTORE_BASE64`，将自动额外生成 `-signed.apk`。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,9 @@
+{
+	"appId": "com.aws.lightsail.manager",
+	"appName": "Lightsail Manager",
+	"webDir": "dist",
+	"server": {
+		"androidScheme": "https"
+	},
+	"android": {}
+}
