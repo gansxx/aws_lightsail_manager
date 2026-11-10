@@ -2,14 +2,17 @@ name: Build and Release Android App
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       release_version:
-        description: '发布版本号 (例如 v1.0.0)'
-        required: true
-        default: 'v1.0.0'
+        description: '指定版本号 (留空则自动读取最新 Tag 并递增 +0.0.1)'
+        required: false
+        default: ''
       is_draft:
         description: '是否发布为草稿 (Draft)'
         type: boolean
@@ -20,9 +23,75 @@ permissions:
   packages: write
 
 jobs:
-  # Job 1: 验证与编译 Web 核心静态资产
+  # Job 1: 动态版本计算器 (推送到主分支时版本号自动加 0.0.1)
+  version:
+    name: Determine Next Release Version (+0.0.1)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc_ver.outputs.version }}
+      is_draft: ${{ steps.calc_ver.outputs.is_draft }}
+    steps:
+      - name: Checkout Code with Full Tag History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Version Auto-Increment (+0.0.1)
+        id: calc_ver
+        run: |
+          # 1. 若用户在 workflow_dispatch 中手动指定了版本号，优先使用
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.release_version }}" ]; then
+            CUSTOM_VER="${{ inputs.release_version }}"
+            [[ "$CUSTOM_VER" != v* ]] && CUSTOM_VER="v$CUSTOM_VER"
+            echo "version=${CUSTOM_VER}" >> $GITHUB_OUTPUT
+            echo "is_draft=${{ inputs.is_draft }}" >> $GITHUB_OUTPUT
+            echo "Using manual input version: ${CUSTOM_VER}"
+            exit 0
+          fi
+
+          # 2. 如果直接推送了 Git 标签 (例如 git push origin v1.2.0)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF_NAME}"
+            echo "version=${TAG_VER}" >> $GITHUB_OUTPUT
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+            echo "Using pushed tag version: ${TAG_VER}"
+            exit 0
+          fi
+
+          # 3. 自动计算：拉取已有最新语义化标签 (例如 v1.0.0) 并将 PATCH 版本自动加 1 (+0.0.1)
+          git fetch --tags --force || true
+          LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n 1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            # 仓库初始第一次自动发布，默认基准设为 v1.0.0
+            LATEST_TAG="v1.0.0"
+            echo "No existing release tags found, initializing baseline from ${LATEST_TAG}"
+          else
+            echo "Found latest existing release tag: ${LATEST_TAG}"
+          fi
+
+          # 解析 Major.Minor.Patch
+          CLEAN_VER="${LATEST_TAG#v}"
+          MAJOR=$(echo "$CLEAN_VER" | cut -d. -f1)
+          MINOR=$(echo "$CLEAN_VER" | cut -d. -f2)
+          PATCH=$(echo "$CLEAN_VER" | cut -d. -f3)
+
+          MAJOR=${MAJOR:-1}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+
+          # 自动递增 0.0.1 (PATCH + 1)
+          NEW_PATCH=$((PATCH + 1))
+          NEXT_VER="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+          echo "version=${NEXT_VER}" >> $GITHUB_OUTPUT
+          echo "is_draft=${{ inputs.is_draft || false }}" >> $GITHUB_OUTPUT
+          echo "🚀 Next auto-incremented release version (+0.0.1): ${NEXT_VER}"
+
+  # Job 2: 验证与编译 Web 核心静态资产
   build-web:
     name: Build Web Applet
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -32,10 +101,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+          else
+            npm install --legacy-peer-deps
+          fi
 
       - name: Code Quality & Lint Check
         run: npm run lint
@@ -53,10 +126,10 @@ jobs:
           path: dist/
           retention-days: 7
 
-  # Job 2: 构建 Android APK 安装包
+  # Job 3: 构建 Android APK 安装包
   build-android:
     name: Build Android APK
-    needs: build-web
+    needs: [version, build-web]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -66,10 +139,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+          else
+            npm install --legacy-peer-deps
+          fi
 
       - name: Download Web Build
         uses: actions/download-artifact@v4
@@ -88,7 +165,7 @@ jobs:
 
       - name: Initialize Capacitor Android Project
         run: |
-          npm install --save-dev @capacitor/core @capacitor/cli @capacitor/android
+          npm install --save-dev --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
           npx cap add android || true
           npx cap sync android
 
@@ -115,20 +192,22 @@ jobs:
         id: prepare_apk
         run: |
           mkdir -p release-output
+          APP_VER="${{ needs.version.outputs.version }}"
+          
           # 寻找构建产物中的 APK (已签名或未签名)
           SIGNED_APK=$(find android/app/build/outputs/apk/release -name "*signed*.apk" | head -n 1)
           UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*-release*.apk" | head -n 1)
           
           if [ -n "$SIGNED_APK" ]; then
-            cp "$SIGNED_APK" release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}-signed.apk
-            echo "apk_path=release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}-signed.apk" >> $GITHUB_OUTPUT
+            cp "$SIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}-signed.apk"
+            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}-signed.apk" >> $GITHUB_OUTPUT
           elif [ -n "$UNSIGNED_APK" ]; then
-            cp "$UNSIGNED_APK" release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}.apk
-            echo "apk_path=release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}.apk" >> $GITHUB_OUTPUT
+            cp "$UNSIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
+            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}.apk" >> $GITHUB_OUTPUT
           else
             echo "No release APK found, packaging web dist bundle"
-            tar -czf release-output/Lightsail-Manager-Web.tar.gz -C dist .
-            echo "apk_path=release-output/Lightsail-Manager-Web.tar.gz" >> $GITHUB_OUTPUT
+            tar -czf "release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" -C dist .
+            echo "apk_path=release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" >> $GITHUB_OUTPUT
           fi
 
       - name: Upload APK Artifact
@@ -138,12 +217,11 @@ jobs:
           path: release-output/
           retention-days: 30
 
-  # Job 3: 自动发布 GitHub Release
+  # Job 4: 自动发布 GitHub Release 并上传 APK
   create-release:
     name: Create GitHub Release
-    needs: [build-web, build-android]
+    needs: [version, build-web, build-android]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -154,27 +232,16 @@ jobs:
           name: lightsail-manager-apk
           path: release-assets
 
-      - name: Extract Release Tag
-        id: tag_info
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.release_version }}" >> $GITHUB_OUTPUT
-            echo "is_draft=${{ inputs.is_draft }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-            echo "is_draft=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Publish GitHub Release with APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag_info.outputs.version }}
-          name: "Lightsail Manager Android ${{ steps.tag_info.outputs.version }}"
-          draft: ${{ steps.tag_info.outputs.is_draft == 'true' }}
+          tag_name: ${{ needs.version.outputs.version }}
+          name: "Lightsail Manager Android ${{ needs.version.outputs.version }}"
+          draft: ${{ needs.version.outputs.is_draft == 'true' }}
           prerelease: false
           files: release-assets/*
           body: |
-            ### 🚀 AWS Lightsail Manager (Android Edition) ${{ steps.tag_info.outputs.version }}
+            ### 🚀 AWS Lightsail Manager (Android Edition) ${{ needs.version.outputs.version }}
 
             #### 🌟 核心功能
             - **暂时删除与休眠（Save Snapshot -> Delete）**：删除实例释放算力前自动生成安全快照，实现 $0 算力计费暂停。

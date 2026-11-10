@@ -118,22 +118,31 @@ base64 -w 0 release.keystore > keystore_base64.txt
 
 仓库已配置好完整的 `.github/workflows/release-app.yml` 工作流。
 
-### 触发方式 1：推送版本标签（推荐）
-在本地终端给代码打上语义化版本 Tag 并推送至 GitHub：
+### 触发方式 1：推送到主分支（版本号自动 +0.0.1）⭐
+每次将代码提交并推送至 `main` 或 `master` 分支：
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git add .
+git commit -m "feat: update feature"
+git push origin main
 ```
-GitHub Actions 将自动执行：
-1. **Build Web Applet**：依赖安装、TypeScript 校验与 Vite 生产构建。
-2. **Build Android APK**：配置 Android SDK & JDK 17，通过 Capacitor/Gradle 构建 Android APK。
-3. **Auto Sign APK**：若配置了密钥则自动签名，否则输出免签 APK。
-4. **Create GitHub Release**：自动在 GitHub Releases 页面发布版本并附带生成的 `.apk` 下载文件。
+GitHub Actions 将自动：
+1. **自动计算下一版本号**：自动查询现有最新 Release 标签（如 `v1.0.0`），并将 Patch 位**自动加 1（即自动 +0.0.1）**生成 `v1.0.1`、`v1.0.2`...
+2. **Build Web Applet**：依赖安装、TypeScript 校验与 Vite 生产构建。
+3. **Build Android APK**：配置 Android SDK & JDK 17，通过 Capacitor/Gradle 构建 Android APK，生成例如 `Lightsail-Manager-v1.0.1.apk`。
+4. **Auto Sign APK**：若配置了密钥则自动签名，否则输出免签 APK。
+5. **Create GitHub Release**：自动在 GitHub Releases 页面发布该版本并附带生成的 `.apk` 下载文件。
 
-### 触发方式 2：在 GitHub 网页手动点击构建
+### 触发方式 2：推送指定版本标签
+也可在本地直接指定特定版本号（如发布大版本 `v2.0.0`）：
+```bash
+git tag v2.0.0
+git push origin v2.0.0
+```
+
+### 触发方式 3：在 GitHub 网页手动点击构建
 1. 访问 GitHub 仓库 ➔ 点击 **Actions** 标签页。
 2. 在左侧选择 **Build and Release Android App** 工作流。
-3. 点击右侧 **Run workflow** 按钮，输入版本号（如 `v1.0.1`）即可启动构建。
+3. 点击右侧 **Run workflow** 按钮，可留空（自动 +0.0.1）或输入自定义版本号启动构建。
 
 ---
 
