@@ -169,21 +169,19 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
-      - name: Build Android Release APK with Gradle
+      - name: Build Android APK with Gradle
         working-directory: ./android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
 
-      - name: Sign APK (If Keystore Secret Provided)
-        if: ${{ env.KEYSTORE_SECRET != '' }}
+      - name: Sign Android Release (If Keystore Provided)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         id: sign_app
-        uses: rigney/android-sign-action@v1
-        env:
-          KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        uses: r0adkll/sign-android-release@v1
         with:
           releaseDirectory: android/app/build/outputs/apk/release
-          signingKey: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          signingKeyBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           alias: ${{ secrets.ANDROID_KEY_ALIAS || 'lightsail-key' }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -194,18 +192,25 @@ jobs:
           mkdir -p release-output
           APP_VER="${{ needs.version.outputs.version }}"
           
-          # 寻找构建产物中的 APK (已签名或未签名)
-          SIGNED_APK=$(find android/app/build/outputs/apk/release -name "*signed*.apk" | head -n 1)
-          UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*-release*.apk" | head -n 1)
+          # 寻找构建产物中的 APK (已签名优先，其次为可直接安装在手机上的 APK)
+          SIGNED_APK=$(find android/app/build/outputs/apk -name "*signed*.apk" | head -n 1)
+          READY_APK=$(find android/app/build/outputs/apk -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
+          ANY_APK=$(find android/app/build/outputs/apk -name "*.apk" | head -n 1)
           
           if [ -n "$SIGNED_APK" ]; then
+            echo "Found production signed APK: $SIGNED_APK"
             cp "$SIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}-signed.apk"
             echo "apk_path=release-output/Lightsail-Manager-${APP_VER}-signed.apk" >> $GITHUB_OUTPUT
-          elif [ -n "$UNSIGNED_APK" ]; then
-            cp "$UNSIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
+          elif [ -n "$READY_APK" ]; then
+            echo "Found installable APK: $READY_APK"
+            cp "$READY_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
+            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}.apk" >> $GITHUB_OUTPUT
+          elif [ -n "$ANY_APK" ]; then
+            echo "Found release APK: $ANY_APK"
+            cp "$ANY_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
             echo "apk_path=release-output/Lightsail-Manager-${APP_VER}.apk" >> $GITHUB_OUTPUT
           else
-            echo "No release APK found, packaging web dist bundle"
+            echo "Packaging web dist bundle as fallback"
             tar -czf "release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" -C dist .
             echo "apk_path=release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" >> $GITHUB_OUTPUT
           fi

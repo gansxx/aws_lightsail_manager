@@ -162,7 +162,10 @@ npm run dev
 # 4. 类型检查与代码校验
 npm run lint
 
-# 5. 生产构建打包
+# 5. CI/CD 本地全真模拟测试 (验证版本 +0.0.1 计算、编译与打包输出)
+npm run test:ci
+
+# 6. 生产构建打包
 npm run build
 ```
 
