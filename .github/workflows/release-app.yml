@@ -1,0 +1,191 @@
+name: Build and Release Android App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: '发布版本号 (例如 v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      is_draft:
+        description: '是否发布为草稿 (Draft)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # Job 1: 验证与编译 Web 核心静态资产
+  build-web:
+    name: Build Web Applet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Code Quality & Lint Check
+        run: npm run lint
+
+      - name: Build Web Application
+        run: npm run build
+        env:
+          VITE_AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'ap-northeast-1' }}
+          VITE_CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+
+      - name: Upload Web Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: dist/
+          retention-days: 7
+
+  # Job 2: 构建 Android APK 安装包
+  build-android:
+    name: Build Android APK
+    needs: build-web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Download Web Build
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: dist
+
+      - name: Setup Java Development Kit (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK Tools
+        uses: android-actions/setup-android@v3
+
+      - name: Initialize Capacitor Android Project
+        run: |
+          npm install --save-dev @capacitor/core @capacitor/cli @capacitor/android
+          npx cap add android || true
+          npx cap sync android
+
+      - name: Build Android Release APK with Gradle
+        working-directory: ./android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Sign APK (If Keystore Secret Provided)
+        if: ${{ env.KEYSTORE_SECRET != '' }}
+        id: sign_app
+        uses: rigney/android-sign-action@v1
+        env:
+          KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        with:
+          releaseDirectory: android/app/build/outputs/apk/release
+          signingKey: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS || 'lightsail-key' }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Prepare APK for Release
+        id: prepare_apk
+        run: |
+          mkdir -p release-output
+          # 寻找构建产物中的 APK (已签名或未签名)
+          SIGNED_APK=$(find android/app/build/outputs/apk/release -name "*signed*.apk" | head -n 1)
+          UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*-release*.apk" | head -n 1)
+          
+          if [ -n "$SIGNED_APK" ]; then
+            cp "$SIGNED_APK" release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}-signed.apk
+            echo "apk_path=release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}-signed.apk" >> $GITHUB_OUTPUT
+          elif [ -n "$UNSIGNED_APK" ]; then
+            cp "$UNSIGNED_APK" release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}.apk
+            echo "apk_path=release-output/Lightsail-Manager-v${{ github.ref_name || inputs.release_version }}.apk" >> $GITHUB_OUTPUT
+          else
+            echo "No release APK found, packaging web dist bundle"
+            tar -czf release-output/Lightsail-Manager-Web.tar.gz -C dist .
+            echo "apk_path=release-output/Lightsail-Manager-Web.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightsail-manager-apk
+          path: release-output/
+          retention-days: 30
+
+  # Job 3: 自动发布 GitHub Release
+  create-release:
+    name: Create GitHub Release
+    needs: [build-web, build-android]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download APK Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lightsail-manager-apk
+          path: release-assets
+
+      - name: Extract Release Tag
+        id: tag_info
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.release_version }}" >> $GITHUB_OUTPUT
+            echo "is_draft=${{ inputs.is_draft }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_info.outputs.version }}
+          name: "Lightsail Manager Android ${{ steps.tag_info.outputs.version }}"
+          draft: ${{ steps.tag_info.outputs.is_draft == 'true' }}
+          prerelease: false
+          files: release-assets/*
+          body: |
+            ### 🚀 AWS Lightsail Manager (Android Edition) ${{ steps.tag_info.outputs.version }}
+
+            #### 🌟 核心功能
+            - **暂时删除与休眠（Save Snapshot -> Delete）**：删除实例释放算力前自动生成安全快照，实现 $0 算力计费暂停。
+            - **快照极速恢复 & Cloudflare DNS 联动**：一键从快照唤醒实例，并将 AWS 分配的新公网 IP 自动写入 Cloudflare DNS 记录。
+            - **定时自动化生命周期**：支持按周配置夜间自动休眠、早晨自动唤醒，内置任务调度守护。
+            - **Floci 仿真模拟器**：支持离线及免扣费测试，支持 429 限流/504 超时等异常注入演练。
+            - **故障排查诊断控制台**：实时 HTTP 调用日志追踪、连通性一键检查与诊断包导出。
+
+            #### 📱 安装说明
+            - 下载下方附带的 `.apk` 文件。
+            - 在 Android 手机上打开并允许「安装未知来源应用」即可安装使用。
+            - 首次使用支持内置 **Floci 模拟器** 免费体验，亦可在「设置」中填入真实 AWS 与 Cloudflare 凭证。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
