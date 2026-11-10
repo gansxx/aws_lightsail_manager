@@ -176,9 +176,11 @@ jobs:
           ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
 
       - name: Sign Android Release (If Keystore Provided)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: env.KEYSTORE_SECRET != ''
         id: sign_app
         uses: r0adkll/sign-android-release@v1
+        env:
+          KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         with:
           releaseDirectory: android/app/build/outputs/apk/release
           signingKeyBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
