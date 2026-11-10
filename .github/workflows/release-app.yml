@@ -160,8 +160,17 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK Tools
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK Licenses & Prepare Environment
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> $GITHUB_ENV
+          if [ -d "$SDK_ROOT/cmdline-tools" ]; then
+            CMDLINE_BIN=$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f | head -n 1)
+            if [ -n "$CMDLINE_BIN" ]; then
+              yes | "$CMDLINE_BIN" --licenses 2>/dev/null || true
+            fi
+          fi
 
       - name: Initialize Capacitor Android Project
         run: |
@@ -178,6 +187,7 @@ jobs:
       - name: Sign Android Release (If Keystore Provided)
         if: env.KEYSTORE_SECRET != ''
         id: sign_app
+        continue-on-error: true
         uses: r0adkll/sign-android-release@v1
         env:
           KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -188,33 +198,44 @@ jobs:
           alias: ${{ secrets.ANDROID_KEY_ALIAS || 'lightsail-key' }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      - name: Prepare APK for Release
+      - name: Prepare APK for Release (Ensure Unsigned APK Never Blocked)
         id: prepare_apk
         run: |
           mkdir -p release-output
           APP_VER="${{ needs.version.outputs.version }}"
-          
-          # 寻找构建产物中的 APK (已签名优先，其次为可直接安装在手机上的 APK)
+
+          echo "Scanning build outputs in android/app/build/outputs/apk/..."
+          ls -R android/app/build/outputs/apk/ || true
+
+          # 1. 若配置了密钥且签名成功，发布已签名的正式 APK
           SIGNED_APK=$(find android/app/build/outputs/apk -name "*signed*.apk" | head -n 1)
-          READY_APK=$(find android/app/build/outputs/apk -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
-          ANY_APK=$(find android/app/build/outputs/apk -name "*.apk" | head -n 1)
-          
           if [ -n "$SIGNED_APK" ]; then
-            echo "Found production signed APK: $SIGNED_APK"
+            echo "✓ Found production signed APK: $SIGNED_APK"
             cp "$SIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}-signed.apk"
-            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}-signed.apk" >> $GITHUB_OUTPUT
-          elif [ -n "$READY_APK" ]; then
-            echo "Found installable APK: $READY_APK"
-            cp "$READY_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
-            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}.apk" >> $GITHUB_OUTPUT
-          elif [ -n "$ANY_APK" ]; then
-            echo "Found release APK: $ANY_APK"
-            cp "$ANY_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
-            echo "apk_path=release-output/Lightsail-Manager-${APP_VER}.apk" >> $GITHUB_OUTPUT
-          else
-            echo "Packaging web dist bundle as fallback"
+          fi
+
+          # 2. 导出未签名 Release APK (确保无密钥时未签名 APK 正常发布)
+          UNSIGNED_APK=$(find android/app/build/outputs/apk -name "*release*.apk" ! -name "*signed*.apk" | head -n 1)
+          if [ -n "$UNSIGNED_APK" ]; then
+            echo "✓ Found unsigned release APK: $UNSIGNED_APK"
+            cp "$UNSIGNED_APK" "release-output/Lightsail-Manager-${APP_VER}-unsigned.apk"
+          fi
+
+          # 3. 导出开箱即装的通用 APK (自带 Android 测试签名，真机无需配置密钥即可直接安装)
+          DEBUG_APK=$(find android/app/build/outputs/apk -name "*debug*.apk" | head -n 1)
+          if [ -n "$DEBUG_APK" ]; then
+            echo "✓ Found directly installable APK: $DEBUG_APK"
+            cp "$DEBUG_APK" "release-output/Lightsail-Manager-${APP_VER}.apk"
+          fi
+
+          # 4. 汇总检查
+          TOTAL_FILES=$(ls -1 release-output/ 2>/dev/null | wc -l)
+          if [ "$TOTAL_FILES" -eq 0 ]; then
+            echo "⚠️ No APK found, packaging web distribution as fallback"
             tar -czf "release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" -C dist .
-            echo "apk_path=release-output/Lightsail-Manager-Web-${APP_VER}.tar.gz" >> $GITHUB_OUTPUT
+          else
+            echo "🎉 Successfully prepared release assets:"
+            ls -lh release-output/
           fi
 
       - name: Upload APK Artifact
