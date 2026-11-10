@@ -1,0 +1,6 @@
+{
+  "name": "Lightsail Manager (Android Edition)",
+  "description": "Android-style AWS Lightsail manager with automatic snapshot-before-delete hibernation, rapid restore with Cloudflare DNS auto-update, scheduled lifecycle automation, and simulated AWS Floci testing engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
