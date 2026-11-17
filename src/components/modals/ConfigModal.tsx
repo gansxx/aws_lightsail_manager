@@ -1,5 +1,6 @@
 /**
  * Cloud Configuration & Settings Modal
+ * Hardened for Android WebView (Capacitor) & Desktop environments
  */
 
 import React, { useState } from 'react';
@@ -23,6 +24,25 @@ import {
 import { useApp } from '../../context/AppContext';
 import { CloudConfig } from '../../types/lightsail';
 
+function normalizeFormConfig(cfg: CloudConfig): CloudConfig {
+  return {
+    mode: cfg?.mode === 'floci_simulation' ? 'floci_simulation' : 'real_cloud',
+    flociSimulationSpeed: cfg?.flociSimulationSpeed || 'normal',
+    simulateFaults: {
+      awsThrottle: Boolean(cfg?.simulateFaults?.awsThrottle),
+      cloudflareError: Boolean(cfg?.simulateFaults?.cloudflareError),
+      snapshotTimeout: Boolean(cfg?.simulateFaults?.snapshotTimeout),
+    },
+    awsAccessKeyId: cfg?.awsAccessKeyId || '',
+    awsSecretAccessKey: cfg?.awsSecretAccessKey || '',
+    awsRegion: cfg?.awsRegion || 'ap-northeast-1',
+    cloudflareApiToken: cfg?.cloudflareApiToken || '',
+    cloudflareZoneId: cfg?.cloudflareZoneId || '',
+    defaultDnsRecordName: cfg?.defaultDnsRecordName || 'test.selfgo.asia',
+    githubRepo: cfg?.githubRepo || 'gansxx/aws_lightsail_manager',
+  };
+}
+
 export const ConfigModal: React.FC = () => {
   const {
     config,
@@ -42,12 +62,12 @@ export const ConfigModal: React.FC = () => {
     updateInstanceDomain,
   } = useApp();
 
-  const [form, setForm] = useState<CloudConfig>(config);
+  const [form, setForm] = useState<CloudConfig>(() => normalizeFormConfig(config));
   const wasOpenRef = React.useRef<boolean>(false);
 
   React.useEffect(() => {
     if (configModalOpen && !wasOpenRef.current) {
-      setForm(config);
+      setForm(normalizeFormConfig(config));
       refreshSecretStatus();
     }
     wasOpenRef.current = configModalOpen;
@@ -56,36 +76,57 @@ export const ConfigModal: React.FC = () => {
   if (!configModalOpen) return null;
 
   const handleSave = async () => {
-    const hasCustomInput = Boolean(
-      form.awsAccessKeyId.trim() ||
-        form.awsSecretAccessKey.trim() ||
-        form.cloudflareApiToken.trim()
-    );
+    const safeAwsKey = (form.awsAccessKeyId || '').trim();
+    const safeAwsSecret = (form.awsSecretAccessKey || '').trim();
+    const safeCfToken = (form.cloudflareApiToken || '').trim();
+    const safeDomain = (form.defaultDnsRecordName || '').trim();
+
+    const hasCustomInput = Boolean(safeAwsKey || safeAwsSecret || safeCfToken);
     const nextForm: CloudConfig = hasCustomInput ? { ...form, mode: 'real_cloud' } : form;
     updateConfig(nextForm);
-    if (nextForm.defaultDnsRecordName.trim()) {
-      await updateInstanceDomain(nextForm.defaultDnsRecordName.trim());
+    if (safeDomain) {
+      await updateInstanceDomain(safeDomain);
     }
     setConfigModalOpen(false);
   };
 
   const handleTestCredentials = async () => {
     const report = await testCurrentCredentials(form);
-    if (report && (report.aws.configured || report.cloudflare.configured)) {
+    if (report && (report.aws?.configured || report.cloudflare?.configured)) {
       setForm((prev) => ({ ...prev, mode: 'real_cloud' }));
       updateConfig({ ...form, mode: 'real_cloud' });
     }
   };
 
-  const sourceLabel = (src: 'env_secret' | 'custom_input' | 'missing') => {
+  const sourceLabel = (src?: 'env_secret' | 'custom_input' | 'missing') => {
     if (src === 'env_secret') return '服务端 Secrets';
-    if (src === 'custom_input') return '表单输入';
+    if (src === 'custom_input') return '表单/本地配置';
     return '未配置';
   };
 
+  const secretRows = envSecretStatus
+    ? [
+        { label: 'AWS_ACCESS_KEY_ID', item: envSecretStatus.awsAccessKeyId },
+        { label: 'AWS_SECRET_ACCESS_KEY', item: envSecretStatus.awsSecretAccessKey },
+        { label: 'CLOUDFLARE_API_TOKEN', item: envSecretStatus.cloudflareApiToken },
+        { label: 'CLOUDFLARE_ZONE_ID', item: envSecretStatus.cloudflareZoneId },
+      ]
+    : [];
+
+  const credentialRows = credentialTestResult
+    ? [
+        { title: 'AWS Lightsail API', item: credentialTestResult.aws },
+        { title: 'Cloudflare DNS API', item: credentialTestResult.cloudflare },
+      ].filter((r) => Boolean(r.item))
+    : [];
+
+  const safeApkAssets = Array.isArray(githubUpdateInfo?.apkAssets)
+    ? githubUpdateInfo!.apkAssets
+    : [];
+
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-t-3xl sm:rounded-2xl p-5 shadow-2xl flex flex-col max-h-[92vh] overflow-y-auto text-xs">
+    <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-950/85">
+      <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-t-3xl sm:rounded-2xl p-5 shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto text-xs">
         {/* Header */}
         <div className="flex items-center justify-between pb-3 border-b border-slate-800">
           <div className="flex items-center gap-2.5">
@@ -98,6 +139,7 @@ export const ConfigModal: React.FC = () => {
             </div>
           </div>
           <button
+            type="button"
             onClick={() => setConfigModalOpen(false)}
             className="text-slate-400 hover:text-white px-2.5 py-2 min-h-[40px] whitespace-nowrap"
           >
@@ -111,7 +153,7 @@ export const ConfigModal: React.FC = () => {
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 font-semibold text-indigo-200">
                 <KeyRound className="w-4 h-4 text-indigo-400 shrink-0" />
-                <span>服务端 Secrets 读取与密钥测试</span>
+                <span>密钥状态读取与连通性测试</span>
               </div>
               <button
                 type="button"
@@ -124,23 +166,18 @@ export const ConfigModal: React.FC = () => {
               </button>
             </div>
 
-            {envSecretStatus ? (
+            {secretRows.length > 0 ? (
               <div className="grid grid-cols-2 gap-1.5 text-[11px]">
-                {[
-                  { label: 'AWS_ACCESS_KEY_ID', item: envSecretStatus.awsAccessKeyId },
-                  { label: 'AWS_SECRET_ACCESS_KEY', item: envSecretStatus.awsSecretAccessKey },
-                  { label: 'CLOUDFLARE_API_TOKEN', item: envSecretStatus.cloudflareApiToken },
-                  { label: 'CLOUDFLARE_ZONE_ID', item: envSecretStatus.cloudflareZoneId },
-                ].map((row) => (
+                {secretRows.map((row) => (
                   <div
                     key={row.label}
                     className="p-2 rounded-lg bg-slate-950/70 border border-slate-800/90 flex flex-col gap-0.5"
                   >
                     <span className="font-mono text-[10px] text-slate-400 truncate">{row.label}</span>
-                    {row.item.configured ? (
+                    {row.item?.configured ? (
                       <span className="text-emerald-300 font-mono flex items-center gap-1 truncate">
                         <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
-                        <span>{row.item.maskedPreview}</span>
+                        <span>{row.item.maskedPreview || '已配置'}</span>
                       </span>
                     ) : (
                       <span className="text-amber-300 flex items-center gap-1">
@@ -152,13 +189,16 @@ export const ConfigModal: React.FC = () => {
                 ))}
               </div>
             ) : (
-              <p className="text-[11px] text-slate-400">正在检测服务端环境变量 Secrets 状态...</p>
+              <p className="text-[11px] text-slate-400">正在检测环境变量或本地凭证状态...</p>
             )}
 
             {envSecretStatus && (
               <div className="text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-1">
                 <span>
-                  默认区域: <strong className="font-mono text-slate-200">{envSecretStatus.awsRegion}</strong>
+                  默认区域:{' '}
+                  <strong className="font-mono text-slate-200">
+                    {envSecretStatus.awsRegion || form.awsRegion || 'ap-northeast-1'}
+                  </strong>
                 </span>
                 {envSecretStatus.cloudflareRecordName && (
                   <span>
@@ -169,22 +209,19 @@ export const ConfigModal: React.FC = () => {
               </div>
             )}
 
-            {credentialTestResult && (
+            {credentialRows.length > 0 && (
               <div className="space-y-2 pt-1 border-t border-indigo-900/40">
-                {[
-                  { title: 'AWS Lightsail API', item: credentialTestResult.aws },
-                  { title: 'Cloudflare DNS API', item: credentialTestResult.cloudflare },
-                ].map((entry) => (
+                {credentialRows.map((entry) => (
                   <div
                     key={entry.title}
                     className={`p-2.5 rounded-xl border flex items-start gap-2 ${
-                      entry.item.success
+                      entry.item?.success
                         ? 'bg-emerald-950/25 border-emerald-800/50 text-emerald-200'
                         : 'bg-rose-950/25 border-rose-800/50 text-rose-200'
                     }`}
                   >
                     <div className="mt-0.5 shrink-0">
-                      {entry.item.success ? (
+                      {entry.item?.success ? (
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                       ) : (
                         <XCircle className="w-4 h-4 text-rose-400" />
@@ -194,10 +231,11 @@ export const ConfigModal: React.FC = () => {
                       <div className="flex items-center justify-between gap-2 flex-wrap">
                         <span className="font-semibold text-white">{entry.title}</span>
                         <span className="text-[10px] font-mono text-slate-300">
-                          {sourceLabel(entry.item.source)} · HTTP {entry.item.status} · {entry.item.latencyMs}ms
+                          {sourceLabel(entry.item?.source)} · HTTP {entry.item?.status ?? 0} ·{' '}
+                          {entry.item?.latencyMs ?? 0}ms
                         </span>
                       </div>
-                      <p className="text-[11px] mt-0.5 break-words">{entry.item.message}</p>
+                      <p className="text-[11px] mt-0.5 break-words">{entry.item?.message || ''}</p>
                     </div>
                   </div>
                 ))}
@@ -298,11 +336,18 @@ export const ConfigModal: React.FC = () => {
                   <label className="flex items-center gap-2 cursor-pointer text-[11px] text-slate-300">
                     <input
                       type="checkbox"
-                      checked={form.simulateFaults.awsThrottle}
+                      checked={Boolean(form.simulateFaults?.awsThrottle)}
                       onChange={(e) =>
                         setForm((prev) => ({
                           ...prev,
-                          simulateFaults: { ...prev.simulateFaults, awsThrottle: e.target.checked },
+                          simulateFaults: {
+                            ...(prev.simulateFaults || {
+                              awsThrottle: false,
+                              cloudflareError: false,
+                              snapshotTimeout: false,
+                            }),
+                            awsThrottle: e.target.checked,
+                          },
                         }))
                       }
                       className="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0"
@@ -312,11 +357,18 @@ export const ConfigModal: React.FC = () => {
                   <label className="flex items-center gap-2 cursor-pointer text-[11px] text-slate-300">
                     <input
                       type="checkbox"
-                      checked={form.simulateFaults.snapshotTimeout}
+                      checked={Boolean(form.simulateFaults?.snapshotTimeout)}
                       onChange={(e) =>
                         setForm((prev) => ({
                           ...prev,
-                          simulateFaults: { ...prev.simulateFaults, snapshotTimeout: e.target.checked },
+                          simulateFaults: {
+                            ...(prev.simulateFaults || {
+                              awsThrottle: false,
+                              cloudflareError: false,
+                              snapshotTimeout: false,
+                            }),
+                            snapshotTimeout: e.target.checked,
+                          },
                         }))
                       }
                       className="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0"
@@ -326,11 +378,18 @@ export const ConfigModal: React.FC = () => {
                   <label className="flex items-center gap-2 cursor-pointer text-[11px] text-slate-300">
                     <input
                       type="checkbox"
-                      checked={form.simulateFaults.cloudflareError}
+                      checked={Boolean(form.simulateFaults?.cloudflareError)}
                       onChange={(e) =>
                         setForm((prev) => ({
                           ...prev,
-                          simulateFaults: { ...prev.simulateFaults, cloudflareError: e.target.checked },
+                          simulateFaults: {
+                            ...(prev.simulateFaults || {
+                              awsThrottle: false,
+                              cloudflareError: false,
+                              snapshotTimeout: false,
+                            }),
+                            cloudflareError: e.target.checked,
+                          },
                         }))
                       }
                       className="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0"
@@ -345,18 +404,18 @@ export const ConfigModal: React.FC = () => {
           {/* AWS Credentials */}
           <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2.5">
             <div className="flex items-center justify-between">
-              <span className="font-semibold text-white">AWS Lightsail 访问凭证（可选覆盖）</span>
-              <span className="text-[10px] text-slate-400">留空则优先使用服务端 Secrets</span>
+              <span className="font-semibold text-white">AWS Lightsail 访问凭证</span>
+              <span className="text-[10px] text-slate-400">支持本地保存或服务端 Secrets</span>
             </div>
             <div className="space-y-2">
               <div>
                 <label className="block text-slate-400 mb-1">AWS Access Key ID:</label>
                 <input
                   type="text"
-                  value={form.awsAccessKeyId}
+                  value={form.awsAccessKeyId || ''}
                   onChange={(e) => setForm((prev) => ({ ...prev, awsAccessKeyId: e.target.value }))}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs"
-                  placeholder="留空则自动读取服务端 AWS_ACCESS_KEY_ID"
+                  placeholder="输入 AWS Access Key ID 或留空读取服务端 Secrets"
                 />
               </div>
 
@@ -364,17 +423,17 @@ export const ConfigModal: React.FC = () => {
                 <label className="block text-slate-400 mb-1">AWS Secret Access Key:</label>
                 <input
                   type="password"
-                  value={form.awsSecretAccessKey}
+                  value={form.awsSecretAccessKey || ''}
                   onChange={(e) => setForm((prev) => ({ ...prev, awsSecretAccessKey: e.target.value }))}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs"
-                  placeholder="留空则自动读取服务端 AWS_SECRET_ACCESS_KEY"
+                  placeholder="输入 AWS Secret Access Key 或留空读取服务端 Secrets"
                 />
               </div>
 
               <div>
                 <label className="block text-slate-400 mb-1">默认 AWS 区域 (Region):</label>
                 <select
-                  value={form.awsRegion}
+                  value={form.awsRegion || 'ap-northeast-1'}
                   onChange={(e) => setForm((prev) => ({ ...prev, awsRegion: e.target.value }))}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white text-xs"
                 >
@@ -392,30 +451,30 @@ export const ConfigModal: React.FC = () => {
           {/* Cloudflare Credentials */}
           <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2.5">
             <div className="flex items-center justify-between">
-              <span className="font-semibold text-white">Cloudflare API 访问凭证（可选覆盖）</span>
-              <span className="text-[10px] text-slate-400">留空则优先使用服务端 Secrets</span>
+              <span className="font-semibold text-white">Cloudflare API 访问凭证</span>
+              <span className="text-[10px] text-slate-400">支持本地保存或服务端 Secrets</span>
             </div>
             <div className="space-y-2">
               <div>
                 <label className="block text-slate-400 mb-1">Cloudflare API Token:</label>
                 <input
                   type="password"
-                  value={form.cloudflareApiToken}
+                  value={form.cloudflareApiToken || ''}
                   onChange={(e) => setForm((prev) => ({ ...prev, cloudflareApiToken: e.target.value }))}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs"
-                  placeholder="留空则自动读取服务端 CLOUDFLARE_API_TOKEN"
+                  placeholder="输入 Cloudflare API Token 或留空读取服务端 Secrets"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-400 mb-1">Zone ID (区域 ID):</label>
                   <input
                     type="text"
-                    value={form.cloudflareZoneId}
+                    value={form.cloudflareZoneId || ''}
                     onChange={(e) => setForm((prev) => ({ ...prev, cloudflareZoneId: e.target.value }))}
                     className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs"
-                    placeholder="留空读取 CLOUDFLARE_ZONE_ID"
+                    placeholder="输入 CLOUDFLARE_ZONE_ID"
                   />
                 </div>
                 <div>
@@ -423,7 +482,7 @@ export const ConfigModal: React.FC = () => {
                   <div className="flex items-center gap-1.5">
                     <input
                       type="text"
-                      value={form.defaultDnsRecordName}
+                      value={form.defaultDnsRecordName || ''}
                       onChange={(e) => setForm((prev) => ({ ...prev, defaultDnsRecordName: e.target.value }))}
                       className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs focus:border-indigo-500 focus:outline-none"
                       placeholder="例如 vpn.selfgo.asia"
@@ -431,8 +490,9 @@ export const ConfigModal: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        if (form.defaultDnsRecordName.trim()) {
-                          updateInstanceDomain(form.defaultDnsRecordName.trim());
+                        const clean = (form.defaultDnsRecordName || '').trim();
+                        if (clean) {
+                          updateInstanceDomain(clean);
                         }
                       }}
                       className="px-2.5 py-2 rounded-lg bg-amber-600/25 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 text-[11px] font-medium whitespace-nowrap shrink-0"
@@ -475,15 +535,19 @@ export const ConfigModal: React.FC = () => {
               />
             </div>
 
-            {githubUpdateInfo && (
+            {githubUpdateInfo && githubUpdateInfo.currentVersion && (
               <div className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2.5">
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <div className="flex items-center gap-2">
                     <span className="text-slate-400">当前版本:</span>
-                    <span className="font-mono font-bold text-white">v{githubUpdateInfo.currentVersion}</span>
+                    <span className="font-mono font-bold text-white">
+                      v{githubUpdateInfo.currentVersion}
+                    </span>
                     <span className="text-slate-600">→</span>
                     <span className="text-slate-400">GitHub 最新:</span>
-                    <span className="font-mono font-bold text-indigo-300">v{githubUpdateInfo.latestVersion}</span>
+                    <span className="font-mono font-bold text-indigo-300">
+                      v{githubUpdateInfo.latestVersion || githubUpdateInfo.currentVersion}
+                    </span>
                   </div>
 
                   {githubUpdateInfo.hasUpdate ? (
@@ -502,10 +566,14 @@ export const ConfigModal: React.FC = () => {
                 {githubUpdateInfo.latestCommit && (
                   <div className="text-[11px] text-slate-400 bg-slate-950/70 p-2 rounded-lg border border-slate-800/80">
                     <div className="flex items-center justify-between font-mono text-[10px] text-slate-400 mb-0.5">
-                      <span>最新提交: #{githubUpdateInfo.latestCommit.sha}</span>
-                      <span>{new Date(githubUpdateInfo.latestCommit.date).toLocaleString('zh-CN')}</span>
+                      <span>最新提交: #{githubUpdateInfo.latestCommit.sha || ''}</span>
+                      <span>
+                        {githubUpdateInfo.latestCommit.date
+                          ? new Date(githubUpdateInfo.latestCommit.date).toLocaleString('zh-CN')
+                          : ''}
+                      </span>
                     </div>
-                    <p className="text-slate-200 truncate">{githubUpdateInfo.latestCommit.message}</p>
+                    <p className="text-slate-200 truncate">{githubUpdateInfo.latestCommit.message || ''}</p>
                   </div>
                 )}
 
@@ -522,7 +590,7 @@ export const ConfigModal: React.FC = () => {
                     </button>
                   )}
 
-                  {githubUpdateInfo.apkAssets.map((apk) => (
+                  {safeApkAssets.map((apk) => (
                     <a
                       key={apk.name}
                       href={apk.downloadUrl}
@@ -537,15 +605,17 @@ export const ConfigModal: React.FC = () => {
                     </a>
                   ))}
 
-                  <a
-                    href={githubUpdateInfo.htmlUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-3 py-2 min-h-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>查看 GitHub Releases</span>
-                  </a>
+                  {githubUpdateInfo.htmlUrl && (
+                    <a
+                      href={githubUpdateInfo.htmlUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-3 py-2 min-h-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>查看 GitHub Releases</span>
+                    </a>
+                  )}
                 </div>
               </div>
             )}
@@ -555,12 +625,14 @@ export const ConfigModal: React.FC = () => {
         {/* Footer */}
         <div className="pt-3 border-t border-slate-800 flex justify-end gap-2.5">
           <button
+            type="button"
             onClick={() => setConfigModalOpen(false)}
             className="px-4 py-2 min-h-[40px] rounded-xl text-xs text-slate-400 hover:text-white bg-slate-800 whitespace-nowrap"
           >
             取消
           </button>
           <button
+            type="button"
             onClick={handleSave}
             className="px-5 py-2 min-h-[40px] rounded-xl text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 flex items-center gap-1.5 shadow-lg shadow-indigo-600/20 whitespace-nowrap"
           >

@@ -222,8 +222,8 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
             </div>
           </div>
         ) : (
-          /* Responsive Desktop View */
-          <div className="w-full max-w-5xl h-[88vh] bg-slate-900 rounded-2xl shadow-xl border border-slate-800 flex flex-col overflow-hidden">
+          /* Responsive Mobile & Desktop View */
+          <div className="w-full max-w-5xl h-[calc(100dvh-49px)] md:h-[88vh] bg-slate-900 md:rounded-2xl shadow-xl border-0 md:border border-slate-800 flex flex-col overflow-hidden">
             <AndroidStatusBar />
             <div className="flex-1 overflow-y-auto overflow-x-hidden relative bg-slate-900">
               <BackgroundTaskPanel />

@@ -18,18 +18,61 @@ import {
   BackgroundTask,
 } from '../types/lightsail';
 import { flociSimulator } from './flociSimulator';
+import {
+  clientAwsLightsailRequest,
+  clientCheckGitHubUpdate,
+  clientGetInstances,
+  clientGetSnapshots,
+  clientSyncCloudflareDns,
+  clientSyncGitHubVersion,
+  clientTestCredentials,
+  getClientCredentialStatus,
+  loadAndroidMetadata,
+  saveAndroidMetadata,
+} from './androidDirectCloud';
+
+class ServerUnavailableError extends Error {
+  constructor(message = 'Local Express API server unavailable (Android APK / Static mode)') {
+    super(message);
+    this.name = 'ServerUnavailableError';
+  }
+}
+
+function isJsonResponse(res: Response): boolean {
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  return ct.includes('application/json');
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (e: any) {
+    throw new ServerUnavailableError(e?.message || 'Network error');
+  }
+
+  // In Capacitor Android WebView, /api/* routes return index.html with 200 OK and text/html
+  if (!isJsonResponse(res)) {
+    throw new ServerUnavailableError(`Non-JSON response from ${url} (${res.status})`);
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!data || typeof data !== 'object') {
+    throw new ServerUnavailableError(`Invalid JSON payload from ${url}`);
+  }
+
+  if (!res.ok) {
+    throw new Error((data as any)?.error || `HTTP ${res.status}`);
+  }
+  return data as T;
+}
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+  return fetchJson<T>(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error || `HTTP ${res.status}`);
-  }
-  return data as T;
 }
 
 export class ApiBridge {
@@ -39,11 +82,28 @@ export class ApiBridge {
   public static async checkGitHubUpdate(repo?: string): Promise<GitHubUpdateInfo> {
     const start = performance.now();
     const targetRepo = (repo || 'gansxx/aws_lightsail_manager').trim();
-    const res = await fetch(`/api/github/update-check?repo=${encodeURIComponent(targetRepo)}`);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error || `检查 GitHub 更新失败 (HTTP ${res.status})`);
+    let data: GitHubUpdateInfo;
+
+    try {
+      const raw = await fetchJson<GitHubUpdateInfo>(
+        `/api/github/update-check?repo=${encodeURIComponent(targetRepo)}`
+      );
+      if (!raw || typeof raw.currentVersion !== 'string') {
+        throw new ServerUnavailableError('Incomplete GitHub update response');
+      }
+      data = {
+        ...raw,
+        apkAssets: Array.isArray(raw.apkAssets) ? raw.apkAssets : [],
+        latestCommit: raw.latestCommit || null,
+      };
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        data = await clientCheckGitHubUpdate(targetRepo);
+      } else {
+        throw err;
+      }
     }
+
     flociSimulator.recordExternalLog({
       service: 'DIAGNOSTIC',
       method: 'GET',
@@ -60,53 +120,86 @@ export class ApiBridge {
       latencyMs: Math.round(performance.now() - start),
       success: true,
     });
-    return data as GitHubUpdateInfo;
+    return data;
   }
 
   /**
    * Sync local app version metadata with remote GitHub version
    */
   public static async syncGitHubVersion(version: string): Promise<{ success: boolean; currentVersion: string }> {
-    return postJson<{ success: boolean; currentVersion: string }>('/api/github/sync-version', {
-      version,
-    });
+    try {
+      return await postJson<{ success: boolean; currentVersion: string }>('/api/github/sync-version', {
+        version,
+      });
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        return clientSyncGitHubVersion(version);
+      }
+      throw err;
+    }
   }
 
   /**
    * Read server environment secret status (never returns raw secret values)
    */
   public static async getCredentialStatus(): Promise<EnvSecretStatus> {
-    const res = await fetch('/api/credentials/status');
-    if (!res.ok) {
-      throw new Error(`获取环境变量状态失败 (HTTP ${res.status})`);
+    try {
+      const data = await fetchJson<EnvSecretStatus>('/api/credentials/status');
+      if (
+        !data?.awsAccessKeyId ||
+        typeof data.awsAccessKeyId.configured !== 'boolean' ||
+        !data?.awsSecretAccessKey ||
+        !data?.cloudflareApiToken ||
+        !data?.cloudflareZoneId
+      ) {
+        return getClientCredentialStatus();
+      }
+      return data;
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        return getClientCredentialStatus();
+      }
+      throw err;
     }
-    return res.json();
   }
 
   /**
-   * Test current AWS & Cloudflare credentials (server reads Secrets / overrides)
+   * Test current AWS & Cloudflare credentials (server reads Secrets / overrides, or Android client direct test)
    */
   public static async testCredentials(config: CloudConfig): Promise<CredentialTestReport> {
-    const report = await postJson<CredentialTestReport>('/api/credentials/test', {
-      awsAccessKeyId: config.awsAccessKeyId,
-      awsSecretAccessKey: config.awsSecretAccessKey,
-      awsRegion: config.awsRegion,
-      cloudflareApiToken: config.cloudflareApiToken,
-      cloudflareZoneId: config.cloudflareZoneId,
-      defaultDnsRecordName: config.defaultDnsRecordName,
-    });
+    let report: CredentialTestReport;
+    try {
+      const raw = await postJson<CredentialTestReport>('/api/credentials/test', {
+        awsAccessKeyId: config.awsAccessKeyId,
+        awsSecretAccessKey: config.awsSecretAccessKey,
+        awsRegion: config.awsRegion,
+        cloudflareApiToken: config.cloudflareApiToken,
+        cloudflareZoneId: config.cloudflareZoneId,
+        defaultDnsRecordName: config.defaultDnsRecordName,
+      });
+      if (!raw?.aws || !raw?.cloudflare) {
+        throw new ServerUnavailableError('Invalid credential test payload');
+      }
+      report = raw;
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        report = await clientTestCredentials(config);
+      } else {
+        throw err;
+      }
+    }
 
     flociSimulator.recordExternalLog({
       service: 'AWS_LIGHTSAIL',
       method: 'POST',
       action: 'TestCredentials (GetInstances)',
-      endpoint: `lightsail.${report.aws.details?.region || config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
-      requestPayload: { source: report.aws.source },
-      responsePayload: report.aws.details || { message: report.aws.message },
-      status: report.aws.status,
-      latencyMs: report.aws.latencyMs,
-      success: report.aws.success,
-      errorMessage: report.aws.success ? undefined : report.aws.message,
+      endpoint: `lightsail.${report.aws?.details?.region || config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { source: report.aws?.source },
+      responsePayload: report.aws?.details || { message: report.aws?.message },
+      status: report.aws?.status || 200,
+      latencyMs: report.aws?.latencyMs || 0,
+      success: Boolean(report.aws?.success),
+      errorMessage: report.aws?.success ? undefined : report.aws?.message,
     });
 
     flociSimulator.recordExternalLog({
@@ -114,12 +207,12 @@ export class ApiBridge {
       method: 'GET',
       action: 'TestCredentials (VerifyToken & Zone)',
       endpoint: 'api.cloudflare.com/client/v4/user/tokens/verify',
-      requestPayload: { source: report.cloudflare.source },
-      responsePayload: report.cloudflare.details || { message: report.cloudflare.message },
-      status: report.cloudflare.status,
-      latencyMs: report.cloudflare.latencyMs,
-      success: report.cloudflare.success,
-      errorMessage: report.cloudflare.success ? undefined : report.cloudflare.message,
+      requestPayload: { source: report.cloudflare?.source },
+      responsePayload: report.cloudflare?.details || { message: report.cloudflare?.message },
+      status: report.cloudflare?.status || 200,
+      latencyMs: report.cloudflare?.latencyMs || 0,
+      success: Boolean(report.cloudflare?.success),
+      errorMessage: report.cloudflare?.success ? undefined : report.cloudflare?.message,
     });
 
     return report;
@@ -135,10 +228,23 @@ export class ApiBridge {
 
     const start = performance.now();
     try {
-      const data = await postJson<{ instances: LightsailInstance[]; latencyMs: number; endpoint: string }>(
-        '/api/lightsail/instances',
-        { config }
-      );
+      let data: { instances: LightsailInstance[]; latencyMs: number; endpoint: string };
+      try {
+        data = await postJson<{ instances: LightsailInstance[]; latencyMs: number; endpoint: string }>(
+          '/api/lightsail/instances',
+          { config }
+        );
+        if (!Array.isArray(data?.instances)) {
+          throw new ServerUnavailableError('Missing instances array');
+        }
+      } catch (innerErr) {
+        if (innerErr instanceof ServerUnavailableError) {
+          data = await clientGetInstances(config);
+        } else {
+          throw innerErr;
+        }
+      }
+
       flociSimulator.recordExternalLog({
         service: 'AWS_LIGHTSAIL',
         method: 'POST',
@@ -175,10 +281,23 @@ export class ApiBridge {
 
     const start = performance.now();
     try {
-      const data = await postJson<{ snapshots: LightsailSnapshot[]; latencyMs: number; endpoint: string }>(
-        '/api/lightsail/snapshots',
-        { config }
-      );
+      let data: { snapshots: LightsailSnapshot[]; latencyMs: number; endpoint: string };
+      try {
+        data = await postJson<{ snapshots: LightsailSnapshot[]; latencyMs: number; endpoint: string }>(
+          '/api/lightsail/snapshots',
+          { config }
+        );
+        if (!Array.isArray(data?.snapshots)) {
+          throw new ServerUnavailableError('Missing snapshots array');
+        }
+      } catch (innerErr) {
+        if (innerErr instanceof ServerUnavailableError) {
+          data = await clientGetSnapshots(config);
+        } else {
+          throw innerErr;
+        }
+      }
+
       flociSimulator.recordExternalLog({
         service: 'AWS_LIGHTSAIL',
         method: 'POST',
@@ -352,18 +471,10 @@ export class ApiBridge {
    */
   public static async getSnapshotLifecyclePolicy(): Promise<SnapshotLifecyclePolicy> {
     try {
-      const res = await fetch('/api/lightsail/snapshots/lifecycle');
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.policy) return data.policy as SnapshotLifecyclePolicy;
-      }
+      const data = await fetchJson<{ policy: SnapshotLifecyclePolicy }>('/api/lightsail/snapshots/lifecycle');
+      if (data?.policy) return data.policy;
     } catch {}
-    return {
-      enabled: true,
-      defaultRetentionHours: 168,
-      maxSnapshotsPerInstance: 3,
-      protectLatestHibernatedSnapshot: true,
-    };
+    return loadAndroidMetadata().lifecyclePolicy;
   }
 
   public static async updateSnapshotLifecyclePolicy(
@@ -371,11 +482,21 @@ export class ApiBridge {
     applyToExistingSnapshots: boolean,
     config: CloudConfig
   ): Promise<SnapshotLifecyclePolicy> {
-    const data = await postJson<{ success: boolean; policy: SnapshotLifecyclePolicy }>(
-      '/api/lightsail/snapshots/lifecycle',
-      { policy, applyToExistingSnapshots, config }
-    );
-    return data.policy;
+    try {
+      const data = await postJson<{ success: boolean; policy: SnapshotLifecyclePolicy }>(
+        '/api/lightsail/snapshots/lifecycle',
+        { policy, applyToExistingSnapshots, config }
+      );
+      return data.policy;
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        const meta = loadAndroidMetadata();
+        meta.lifecyclePolicy = { ...meta.lifecyclePolicy, ...policy };
+        saveAndroidMetadata(meta);
+        return meta.lifecyclePolicy;
+      }
+      throw err;
+    }
   }
 
   public static async setSnapshotRetention(
@@ -395,11 +516,27 @@ export class ApiBridge {
       return resolved;
     }
 
-    const data = await postJson<{ success: boolean; snapshotName: string; autoDeleteAt: string | null }>(
-      '/api/lightsail/snapshots/retention',
-      { snapshotName, retentionHours, autoDeleteAt }
-    );
-    return data.autoDeleteAt;
+    try {
+      const data = await postJson<{ success: boolean; snapshotName: string; autoDeleteAt: string | null }>(
+        '/api/lightsail/snapshots/retention',
+        { snapshotName, retentionHours, autoDeleteAt }
+      );
+      return data.autoDeleteAt;
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        const resolved =
+          retentionHours !== undefined
+            ? retentionHours && retentionHours > 0
+              ? new Date(Date.now() + retentionHours * 3600_000).toISOString()
+              : null
+            : autoDeleteAt || null;
+        const meta = loadAndroidMetadata();
+        meta.snapshotAutoDeleteAt[snapshotName] = resolved;
+        saveAndroidMetadata(meta);
+        return resolved;
+      }
+      throw err;
+    }
   }
 
   public static async cleanupExpiredSnapshots(
@@ -1004,13 +1141,23 @@ export class ApiBridge {
       return flociSimulator.updateCloudflareDnsRecord(domainName, ip, zoneId, proxied, config);
     }
 
-    const data = await postJson<{ record: CloudflareDnsRecord; latencyMs: number }>('/api/cloudflare/sync', {
-      domainName,
-      ip,
-      zoneId,
-      proxied,
-      config,
-    });
+    let data: { record: CloudflareDnsRecord; latencyMs: number };
+    try {
+      data = await postJson<{ record: CloudflareDnsRecord; latencyMs: number }>('/api/cloudflare/sync', {
+        domainName,
+        ip,
+        zoneId,
+        proxied,
+        config,
+      });
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        data = await clientSyncCloudflareDns(domainName, ip, zoneId, proxied, config);
+      } else {
+        throw err;
+      }
+    }
+
     flociSimulator.recordExternalLog({
       service: 'CLOUDFLARE_DNS',
       method: 'PUT',
@@ -1033,16 +1180,27 @@ export class ApiBridge {
       return flociSimulator.deleteSnapshot(snapshotName, config);
     }
 
-    const res = await fetch(`/api/lightsail/snapshots/${encodeURIComponent(snapshotName)}`, {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error || `HTTP ${res.status}`);
+    try {
+      await fetchJson(`/api/lightsail/snapshots/${encodeURIComponent(snapshotName)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config }),
+      });
+      return true;
+    } catch (err) {
+      if (err instanceof ServerUnavailableError) {
+        const awsRes = await clientAwsLightsailRequest(
+          'DeleteInstanceSnapshot',
+          { instanceSnapshotName: snapshotName },
+          config
+        );
+        if (!awsRes.ok) {
+          throw new Error(awsRes.data?.message || `HTTP ${awsRes.status}`);
+        }
+        return true;
+      }
+      throw err;
     }
-    return true;
   }
 
   /**
@@ -1193,11 +1351,8 @@ export class ApiBridge {
    */
   public static async getBackgroundTasks(): Promise<BackgroundTask[]> {
     try {
-      const res = await fetch('/api/lightsail/tasks');
-      if (res.ok) {
-        const data = await res.json();
-        return Array.isArray(data?.tasks) ? data.tasks : [];
-      }
+      const data = await fetchJson<{ tasks: BackgroundTask[] }>('/api/lightsail/tasks');
+      return Array.isArray(data?.tasks) ? data.tasks : [];
     } catch {}
     return [];
   }

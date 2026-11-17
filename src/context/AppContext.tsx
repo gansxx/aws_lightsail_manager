@@ -178,7 +178,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [snapshots, setSnapshots] = useState<LightsailSnapshot[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'instances' | 'snapshots' | 'automation' | 'debug'>('instances');
-  const [viewMode, setViewMode] = useState<'android_frame' | 'responsive'>('android_frame');
+  const [viewMode, setViewMode] = useState<'android_frame' | 'responsive'>(() => {
+    try {
+      const isNative = Boolean((window as any)?.Capacitor?.isNativePlatform?.());
+      const isMobileScreen = typeof window !== 'undefined' && window.innerWidth < 640;
+      return isNative || isMobileScreen ? 'responsive' : 'android_frame';
+    } catch {
+      return 'android_frame';
+    }
+  });
   const [apiLogs, setApiLogs] = useState<ApiLogEntry[]>([]);
   const [scheduleHistory, setScheduleHistory] = useState<ScheduleExecutionRecord[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticResult[]>([]);
@@ -227,7 +235,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return {
           ...DEFAULT_CONFIG,
           ...parsed,
-          defaultDnsRecordName: customDomain || parsed.defaultDnsRecordName || DEFAULT_CONFIG.defaultDnsRecordName,
+          simulateFaults: {
+            ...DEFAULT_CONFIG.simulateFaults,
+            ...(parsed?.simulateFaults || {}),
+          },
+          defaultDnsRecordName: customDomain || parsed?.defaultDnsRecordName || DEFAULT_CONFIG.defaultDnsRecordName,
+          githubRepo: parsed?.githubRepo || DEFAULT_CONFIG.githubRepo,
           mode: explicitMode === 'floci_simulation' ? 'floci_simulation' : 'real_cloud',
         };
       }
@@ -385,13 +398,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const refreshSecretStatus = useCallback(async () => {
     try {
       const status = await ApiBridge.getCredentialStatus();
-      setEnvSecretStatus(status);
+      if (status && status.awsAccessKeyId && typeof status.awsAccessKeyId.configured === 'boolean') {
+        setEnvSecretStatus(status);
+      }
 
       const explicitMode = localStorage.getItem('lightsail_mode_explicit');
       const customSavedDomain = localStorage.getItem('lightsail_custom_domain');
       if (
-        status.awsAccessKeyId.configured &&
-        status.awsSecretAccessKey.configured &&
+        status?.awsAccessKeyId?.configured &&
+        status?.awsSecretAccessKey?.configured &&
         explicitMode !== 'floci_simulation'
       ) {
         purgeSimulationState();
@@ -933,15 +948,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try {
         const repoToCheck = overrideRepo || config.githubRepo || 'gansxx/aws_lightsail_manager';
         const info = await ApiBridge.checkGitHubUpdate(repoToCheck);
-        setGithubUpdateInfo(info);
-        if (!silent) {
-          if (info.hasUpdate) {
-            showToast(`发现 GitHub 新版本 v${info.latestVersion}（当前 v${info.currentVersion}）`, 'info');
-          } else {
-            showToast(`当前已是最新版本 v${info.currentVersion}`, 'success');
+        if (info && typeof info.currentVersion === 'string') {
+          const safeInfo: GitHubUpdateInfo = {
+            ...info,
+            apkAssets: Array.isArray(info.apkAssets) ? info.apkAssets : [],
+            latestCommit: info.latestCommit || null,
+          };
+          setGithubUpdateInfo(safeInfo);
+          if (!silent) {
+            if (safeInfo.hasUpdate) {
+              showToast(`发现 GitHub 新版本 v${safeInfo.latestVersion}（当前 v${safeInfo.currentVersion}）`, 'info');
+            } else {
+              showToast(`当前已是最新版本 v${safeInfo.currentVersion}`, 'success');
+            }
           }
+          return safeInfo;
         }
-        return info;
+        return null;
       } catch (e: any) {
         if (!silent) {
           showToast(`检查 GitHub 更新失败: ${e.message}`, 'error');

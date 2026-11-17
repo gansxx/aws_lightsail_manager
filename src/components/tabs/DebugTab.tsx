@@ -1,5 +1,6 @@
 /**
  * Debug Tab: Live API request/response inspector, one-click diagnostics, and fault troubleshooting
+ * Hardened for Android WebView (Capacitor) & Desktop environments
  */
 
 import React, { useState } from 'react';
@@ -55,14 +56,18 @@ export const DebugTab: React.FC = () => {
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [diagnosing, setDiagnosing] = useState<boolean>(false);
 
-  const filteredLogs = apiLogs.filter((log) => {
+  const safeLogs = Array.isArray(apiLogs) ? apiLogs : [];
+  const safeDiagnostics = Array.isArray(diagnostics) ? diagnostics : [];
+
+  const filteredLogs = safeLogs.filter((log) => {
+    if (!log) return false;
     if (serviceFilter !== 'ALL' && log.service !== serviceFilter) return false;
     if (onlyErrors && log.success) return false;
     if (searchTerm) {
       const term = searchTerm.toLowerCase();
-      const matchAction = log.action.toLowerCase().includes(term);
-      const matchEndpoint = log.endpoint.toLowerCase().includes(term);
-      const matchErr = log.errorMessage?.toLowerCase().includes(term);
+      const matchAction = (log.action || '').toLowerCase().includes(term);
+      const matchEndpoint = (log.endpoint || '').toLowerCase().includes(term);
+      const matchErr = (log.errorMessage || '').toLowerCase().includes(term);
       return matchAction || matchEndpoint || matchErr;
     }
     return true;
@@ -70,49 +75,90 @@ export const DebugTab: React.FC = () => {
 
   const handleRunDiagnostics = async () => {
     setDiagnosing(true);
-    await runDiagnostics();
-    setDiagnosing(false);
+    try {
+      await runDiagnostics();
+    } finally {
+      setDiagnosing(false);
+    }
   };
 
-  const copyLogJson = (log: ApiLogEntry) => {
-    navigator.clipboard.writeText(JSON.stringify(log, null, 2));
-    showToast('日志详情已复制到剪贴板', 'info');
+  const copyLogJson = async (log: ApiLogEntry) => {
+    const text = JSON.stringify(log, null, 2);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        showToast('日志详情已复制到剪贴板', 'info');
+        return;
+      }
+    } catch {}
+    showToast('已生成日志 JSON 数据', 'info');
   };
 
-  const exportDebugBundle = () => {
+  const exportDebugBundle = async () => {
     const bundle = {
       timestamp: new Date().toISOString(),
       config: {
-        mode: config.mode,
-        awsRegion: config.awsRegion,
-        hasAwsKey: !!config.awsAccessKeyId,
-        hasCloudflareToken: !!config.cloudflareApiToken,
-        cloudflareZoneId: config.cloudflareZoneId,
+        mode: config?.mode,
+        awsRegion: config?.awsRegion,
+        hasAwsKey: Boolean(config?.awsAccessKeyId),
+        hasCloudflareToken: Boolean(config?.cloudflareApiToken),
+        cloudflareZoneId: config?.cloudflareZoneId,
       },
-      instances: instances.map((i) => ({
+      instances: (Array.isArray(instances) ? instances : []).map((i) => ({
         name: i.name,
         state: i.state,
         ip: i.publicIpAddress,
         domain: i.cloudflareBinding?.domain,
       })),
-      snapshots: snapshots.map((s) => ({
+      snapshots: (Array.isArray(snapshots) ? snapshots : []).map((s) => ({
         name: s.name,
         from: s.fromInstanceName,
         size: s.sizeInGb,
       })),
-      recentLogs: apiLogs.slice(0, 30),
-      diagnostics,
+      recentLogs: safeLogs.slice(0, 30),
+      diagnostics: safeDiagnostics,
     };
 
-    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `lightsail-debug-bundle-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('已导出调试诊断报告包 (JSON)', 'success');
+    const jsonText = JSON.stringify(bundle, null, 2);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(jsonText);
+      }
+    } catch {}
+
+    try {
+      const blob = new Blob([jsonText], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lightsail-debug-bundle-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('已导出调试诊断报告包 (JSON) 并复制到剪贴板', 'success');
+    } catch {
+      showToast('诊断报告包 JSON 已复制到剪贴板', 'success');
+    }
   };
+
+  const secretRows = envSecretStatus
+    ? [
+        { label: 'AWS_ACCESS_KEY_ID', item: envSecretStatus.awsAccessKeyId },
+        { label: 'AWS_SECRET_ACCESS_KEY', item: envSecretStatus.awsSecretAccessKey },
+        { label: 'CLOUDFLARE_API_TOKEN', item: envSecretStatus.cloudflareApiToken },
+        { label: 'CLOUDFLARE_ZONE_ID', item: envSecretStatus.cloudflareZoneId },
+      ]
+    : [];
+
+  const credentialRows = credentialTestResult
+    ? [
+        { title: 'AWS Lightsail 真实鉴权测试', item: credentialTestResult.aws },
+        { title: 'Cloudflare API 真实鉴权测试', item: credentialTestResult.cloudflare },
+      ].filter((r) => Boolean(r.item))
+    : [];
+
+  const safeApkAssets = Array.isArray(githubUpdateInfo?.apkAssets)
+    ? githubUpdateInfo!.apkAssets
+    : [];
 
   return (
     <div className="p-4 space-y-4 pb-24 text-xs">
@@ -123,6 +169,7 @@ export const DebugTab: React.FC = () => {
           <p className="text-slate-400">密钥验证、调用日志流、全链路连通性诊断与异常排查</p>
         </div>
         <button
+          type="button"
           onClick={exportDebugBundle}
           className="px-2.5 py-2 min-h-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
           title="导出调试日志与诊断快照"
@@ -144,7 +191,7 @@ export const DebugTab: React.FC = () => {
               type="button"
               onClick={() => refreshSecretStatus()}
               className="px-2.5 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1 whitespace-nowrap"
-              title="重新读取服务端 Secrets 状态"
+              title="重新读取服务端或本地凭证状态"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>刷新</span>
@@ -161,55 +208,47 @@ export const DebugTab: React.FC = () => {
           </div>
         </div>
 
-        {envSecretStatus ? (
+        {secretRows.length > 0 ? (
           <div className="grid grid-cols-2 gap-1.5 text-[11px]">
-            {[
-              { label: 'AWS_ACCESS_KEY_ID', item: envSecretStatus.awsAccessKeyId },
-              { label: 'AWS_SECRET_ACCESS_KEY', item: envSecretStatus.awsSecretAccessKey },
-              { label: 'CLOUDFLARE_API_TOKEN', item: envSecretStatus.cloudflareApiToken },
-              { label: 'CLOUDFLARE_ZONE_ID', item: envSecretStatus.cloudflareZoneId },
-            ].map((row) => (
+            {secretRows.map((row) => (
               <div
                 key={row.label}
                 className="p-2 rounded-xl bg-slate-950/75 border border-slate-800 flex flex-col gap-0.5"
               >
                 <span className="font-mono text-[10px] text-slate-400 truncate">{row.label}</span>
-                {row.item.configured ? (
+                {row.item?.configured ? (
                   <span className="text-emerald-300 font-mono flex items-center gap-1 truncate">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
                     <span>
-                      {row.item.maskedPreview} ({row.item.length} chars)
+                      {row.item.maskedPreview || '已配置'} ({row.item.length ?? 0} chars)
                     </span>
                   </span>
                 ) : (
                   <span className="text-amber-300 flex items-center gap-1">
                     <XCircle className="w-3 h-3 text-amber-400 shrink-0" />
-                    <span>未读取到环境变量</span>
+                    <span>未检测到</span>
                   </span>
                 )}
               </div>
             ))}
           </div>
         ) : (
-          <p className="text-[11px] text-slate-400">正在检查服务端 Secrets 读取情况...</p>
+          <p className="text-[11px] text-slate-400">正在检查密钥与环境变量读取情况...</p>
         )}
 
-        {credentialTestResult && (
+        {credentialRows.length > 0 && (
           <div className="space-y-2 pt-1">
-            {[
-              { title: 'AWS Lightsail 真实鉴权测试', item: credentialTestResult.aws },
-              { title: 'Cloudflare API 真实鉴权测试', item: credentialTestResult.cloudflare },
-            ].map((entry) => (
+            {credentialRows.map((entry) => (
               <div
                 key={entry.title}
                 className={`p-2.5 rounded-xl border flex items-start gap-2.5 ${
-                  entry.item.success
+                  entry.item?.success
                     ? 'bg-emerald-950/20 border-emerald-800/40 text-emerald-200'
                     : 'bg-rose-950/20 border-rose-800/40 text-rose-200'
                 }`}
               >
                 <div className="mt-0.5 shrink-0">
-                  {entry.item.success ? (
+                  {entry.item?.success ? (
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                   ) : (
                     <XCircle className="w-4 h-4 text-rose-400" />
@@ -219,15 +258,17 @@ export const DebugTab: React.FC = () => {
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <span className="font-semibold text-white">{entry.title}</span>
                     <span className="text-[10px] font-mono opacity-80">
-                      {entry.item.source === 'env_secret'
+                      {entry.item?.source === 'env_secret'
                         ? 'Secrets'
-                        : entry.item.source === 'custom_input'
+                        : entry.item?.source === 'custom_input'
                         ? '手动输入'
                         : '缺失'}{' '}
-                      · HTTP {entry.item.status} · {entry.item.latencyMs}ms
+                      · HTTP {entry.item?.status ?? 0} · {entry.item?.latencyMs ?? 0}ms
                     </span>
                   </div>
-                  <span className="text-[11px] opacity-90 block mt-0.5 break-words">{entry.item.message}</span>
+                  <span className="text-[11px] opacity-90 block mt-0.5 break-words">
+                    {entry.item?.message || ''}
+                  </span>
                 </div>
               </div>
             ))}
@@ -253,24 +294,30 @@ export const DebugTab: React.FC = () => {
           </button>
         </div>
 
-        {githubUpdateInfo ? (
+        {githubUpdateInfo && githubUpdateInfo.currentVersion ? (
           <div className="space-y-2 text-[11px]">
             <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 flex items-center justify-between flex-wrap gap-2">
               <div className="flex items-center gap-2">
                 <span className="text-slate-400">源仓库:</span>
-                <span className="font-mono text-slate-200">{githubUpdateInfo.repo}</span>
+                <span className="font-mono text-slate-200">
+                  {githubUpdateInfo.repo || 'gansxx/aws_lightsail_manager'}
+                </span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="font-mono text-white">当前 v{githubUpdateInfo.currentVersion}</span>
                 <span className="text-slate-500">→</span>
-                <span className="font-mono font-bold text-indigo-300">最新 v{githubUpdateInfo.latestVersion}</span>
+                <span className="font-mono font-bold text-indigo-300">
+                  最新 v{githubUpdateInfo.latestVersion || githubUpdateInfo.currentVersion}
+                </span>
               </div>
             </div>
 
             {githubUpdateInfo.latestCommit && (
               <div className="p-2 rounded-xl bg-slate-900/50 border border-slate-800/80 text-slate-300">
-                <span className="font-mono text-indigo-400 mr-1.5">#{githubUpdateInfo.latestCommit.sha}</span>
-                <span>{githubUpdateInfo.latestCommit.message}</span>
+                <span className="font-mono text-indigo-400 mr-1.5">
+                  #{githubUpdateInfo.latestCommit.sha || ''}
+                </span>
+                <span>{githubUpdateInfo.latestCommit.message || ''}</span>
               </div>
             )}
 
@@ -287,7 +334,7 @@ export const DebugTab: React.FC = () => {
                 </button>
               )}
 
-              {githubUpdateInfo.apkAssets.map((apk) => (
+              {safeApkAssets.map((apk) => (
                 <a
                   key={apk.name}
                   href={apk.downloadUrl}
@@ -296,23 +343,27 @@ export const DebugTab: React.FC = () => {
                   className="px-3 py-2 min-h-[40px] rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>下载 {apk.name} ({apk.sizeMb} MB)</span>
+                  <span>
+                    下载 {apk.name} ({apk.sizeMb} MB)
+                  </span>
                 </a>
               ))}
 
-              <a
-                href={githubUpdateInfo.htmlUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-3 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
-              >
-                <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
-                <span>打开 GitHub Releases</span>
-              </a>
+              {githubUpdateInfo.htmlUrl && (
+                <a
+                  href={githubUpdateInfo.htmlUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                >
+                  <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>打开 GitHub Releases</span>
+                </a>
+              )}
             </div>
           </div>
         ) : (
-          <p className="text-[11px] text-slate-400">正在同步 GitHub 源仓库版本信息...</p>
+          <p className="text-[11px] text-slate-400">点击上方「检查更新」可实时拉取 GitHub 仓库 Release 与最新提交信息</p>
         )}
       </div>
 
@@ -324,6 +375,7 @@ export const DebugTab: React.FC = () => {
             <h3 className="font-bold text-white">一键全链路诊断</h3>
           </div>
           <button
+            type="button"
             onClick={handleRunDiagnostics}
             disabled={diagnosing}
             className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium flex items-center gap-1.5 transition-colors shadow-sm"
@@ -333,13 +385,13 @@ export const DebugTab: React.FC = () => {
           </button>
         </div>
 
-        {diagnostics.length === 0 ? (
+        {safeDiagnostics.length === 0 ? (
           <p className="text-[11px] text-slate-400">
             点击「执行诊断」可自动检测 AWS 连通性、Cloudflare Token 有效性、DNS 解析漂移与快照完整性。
           </p>
         ) : (
           <div className="space-y-2 pt-1">
-            {diagnostics.map((d) => (
+            {safeDiagnostics.map((d) => (
               <div
                 key={d.id}
                 className={`p-2.5 rounded-xl border flex items-start gap-2.5 ${
@@ -379,10 +431,14 @@ export const DebugTab: React.FC = () => {
           <label className="flex items-center gap-2 p-2 rounded-xl bg-slate-900/60 border border-slate-800 cursor-pointer">
             <input
               type="checkbox"
-              checked={config.simulateFaults.awsThrottle}
+              checked={Boolean(config?.simulateFaults?.awsThrottle)}
               onChange={(e) =>
                 updateConfig({
-                  simulateFaults: { ...config.simulateFaults, awsThrottle: e.target.checked },
+                  simulateFaults: {
+                    awsThrottle: e.target.checked,
+                    cloudflareError: Boolean(config?.simulateFaults?.cloudflareError),
+                    snapshotTimeout: Boolean(config?.simulateFaults?.snapshotTimeout),
+                  },
                 })
               }
               className="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0"
@@ -393,10 +449,14 @@ export const DebugTab: React.FC = () => {
           <label className="flex items-center gap-2 p-2 rounded-xl bg-slate-900/60 border border-slate-800 cursor-pointer">
             <input
               type="checkbox"
-              checked={config.simulateFaults.cloudflareError}
+              checked={Boolean(config?.simulateFaults?.cloudflareError)}
               onChange={(e) =>
                 updateConfig({
-                  simulateFaults: { ...config.simulateFaults, cloudflareError: e.target.checked },
+                  simulateFaults: {
+                    awsThrottle: Boolean(config?.simulateFaults?.awsThrottle),
+                    cloudflareError: e.target.checked,
+                    snapshotTimeout: Boolean(config?.simulateFaults?.snapshotTimeout),
+                  },
                 })
               }
               className="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0"
@@ -416,6 +476,7 @@ export const DebugTab: React.FC = () => {
           </div>
 
           <button
+            type="button"
             onClick={clearApiLogs}
             className="text-slate-400 hover:text-rose-400 flex items-center gap-1 text-[11px]"
           >
@@ -438,6 +499,7 @@ export const DebugTab: React.FC = () => {
               />
             </div>
             <button
+              type="button"
               onClick={() => setOnlyErrors(!onlyErrors)}
               className={`px-2.5 py-1 rounded-lg border text-xs transition-colors ${
                 onlyErrors
@@ -449,10 +511,11 @@ export const DebugTab: React.FC = () => {
             </button>
           </div>
 
-          <div className="flex items-center gap-1.5 text-[11px]">
-            {['ALL', 'AWS_LIGHTSAIL', 'CLOUDFLARE_DNS', 'SCHEDULER'].map((svc) => (
+          <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
+            {['ALL', 'AWS_LIGHTSAIL', 'CLOUDFLARE_DNS', 'SCHEDULER', 'DIAGNOSTIC'].map((svc) => (
               <button
                 key={svc}
+                type="button"
                 onClick={() => setServiceFilter(svc)}
                 className={`px-2 py-0.5 rounded-md transition-colors ${
                   serviceFilter === svc
@@ -466,7 +529,9 @@ export const DebugTab: React.FC = () => {
                   ? 'AWS'
                   : svc === 'CLOUDFLARE_DNS'
                   ? 'Cloudflare'
-                  : '调度器'}
+                  : svc === 'SCHEDULER'
+                  ? '调度器'
+                  : '系统诊断'}
               </button>
             ))}
           </div>
@@ -481,11 +546,14 @@ export const DebugTab: React.FC = () => {
           ) : (
             filteredLogs.map((log) => {
               const isExpanded = expandedLogId === log.id;
-              const formattedTime = new Date(log.timestamp).toLocaleTimeString('zh-CN', {
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              });
+              let formattedTime = '';
+              try {
+                formattedTime = new Date(log.timestamp).toLocaleTimeString('zh-CN', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                });
+              } catch {}
 
               return (
                 <div
@@ -501,9 +569,9 @@ export const DebugTab: React.FC = () => {
                     onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
                     className="p-2.5 flex items-center justify-between cursor-pointer hover:bg-slate-900/50"
                   >
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
                       <span
-                        className={`text-[10px] font-mono font-bold px-1.5 py-0.2 rounded ${
+                        className={`text-[10px] font-mono font-bold px-1.5 py-0.2 rounded shrink-0 ${
                           log.method === 'POST'
                             ? 'bg-indigo-950 text-indigo-400 border border-indigo-800'
                             : log.method === 'GET'
@@ -514,8 +582,8 @@ export const DebugTab: React.FC = () => {
                         {log.method}
                       </span>
 
-                      <div>
-                        <span className="font-mono text-white font-semibold text-xs">
+                      <div className="min-w-0">
+                        <span className="font-mono text-white font-semibold text-xs block truncate">
                           {log.action}
                         </span>
                         <span className="text-[10px] text-slate-500 block truncate max-w-[200px]">
@@ -524,7 +592,7 @@ export const DebugTab: React.FC = () => {
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 shrink-0">
                       <span
                         className={`text-[10px] font-mono font-semibold ${
                           log.status === 200
@@ -555,6 +623,7 @@ export const DebugTab: React.FC = () => {
                           <strong className="text-white">{log.latencyMs} ms</strong>
                         </span>
                         <button
+                          type="button"
                           onClick={() => copyLogJson(log)}
                           className="text-[11px] text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
                         >

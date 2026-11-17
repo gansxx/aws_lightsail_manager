@@ -10,5 +10,10 @@
       "keystorePath": "release.keystore",
       "keystoreAlias": "lightsail-key"
     }
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
   }
 }
