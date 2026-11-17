@@ -8,6 +8,8 @@ import { Clock, Moon, Sun, Play, Check, AlertCircle } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { flociSimulator } from '../../services/flociSimulator';
 
+import { schedulerService } from '../../services/scheduler';
+
 const DAYS = [
   { val: 1, label: '周一' },
   { val: 2, label: '周二' },
@@ -26,6 +28,7 @@ export const ScheduleModal: React.FC = () => {
     showToast,
     triggerTestHibernateSchedule,
     triggerTestStartSchedule,
+    config,
   } = useApp();
   const { isOpen, instance } = scheduleModal;
 
@@ -66,19 +69,20 @@ export const ScheduleModal: React.FC = () => {
   };
 
   const handleSave = () => {
-    flociSimulator.updateInstanceSchedules(
-      instance.name,
-      {
-        enabled: hibernateEnabled,
-        time: hibernateTime,
-        daysOfWeek: hibernateDays,
-      },
-      {
-        enabled: startEnabled,
-        time: startTime,
-        daysOfWeek: startDays,
-      }
-    );
+    const hibRule = {
+      enabled: hibernateEnabled,
+      time: hibernateTime,
+      daysOfWeek: hibernateDays,
+    };
+    const startRule = {
+      enabled: startEnabled,
+      time: startTime,
+      daysOfWeek: startDays,
+    };
+    schedulerService.saveInstanceScheduleOverride(instance.name, hibRule, startRule);
+    if (config.mode === 'floci_simulation') {
+      flociSimulator.updateInstanceSchedules(instance.name, hibRule, startRule);
+    }
     refreshData();
     showToast(`实例 ${instance.name} 的定时任务已保存`, 'success');
     closeScheduleModal();

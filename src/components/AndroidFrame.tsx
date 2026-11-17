@@ -4,7 +4,16 @@
  */
 
 import React from 'react';
-import { Smartphone, Monitor, Settings, RefreshCw, Sparkles, ShieldCheck } from 'lucide-react';
+import {
+  Smartphone,
+  Monitor,
+  Settings,
+  RefreshCw,
+  Sparkles,
+  ShieldCheck,
+  GitBranch,
+  ArrowUpCircle,
+} from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { AndroidStatusBar } from './AndroidStatusBar';
 import { AndroidBottomNav } from './AndroidBottomNav';
@@ -19,6 +28,9 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
     loading,
     instances,
     resetSimulator,
+    githubUpdateInfo,
+    checkingGitHubUpdate,
+    checkGitHubUpdate,
   } = useApp();
 
   const hibernatedCount = instances.filter((i) => i.state === 'hibernated').length;
@@ -30,11 +42,10 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
       <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md px-4 py-2.5 flex items-center justify-between text-xs select-none sticky top-0 z-40">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/50" />
             <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
               <span>Lightsail Manager</span>
-              <span className="text-[11px] font-normal text-indigo-400 bg-indigo-950/80 border border-indigo-800/60 px-1.5 py-0.5 rounded">
-                Android App
+              <span className="text-[11px] font-mono font-normal text-indigo-300 bg-indigo-950/80 border border-indigo-800/60 px-1.5 py-0.5 rounded">
+                v{githubUpdateInfo?.currentVersion || '0.0.1'}
               </span>
             </h1>
           </div>
@@ -48,6 +59,32 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
 
         {/* Action Controls */}
         <div className="flex items-center gap-2">
+          {/* GitHub Update Check Button */}
+          <button
+            onClick={() => {
+              checkGitHubUpdate();
+              setConfigModalOpen(true);
+            }}
+            disabled={checkingGitHubUpdate}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border transition-colors whitespace-nowrap ${
+              githubUpdateInfo?.hasUpdate
+                ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-200 hover:bg-indigo-600/30'
+                : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white hover:bg-slate-800'
+            }`}
+            title="检查 GitHub 源新版本与 APK 更新"
+          >
+            {githubUpdateInfo?.hasUpdate ? (
+              <ArrowUpCircle className="w-3.5 h-3.5 text-indigo-400" />
+            ) : (
+              <GitBranch className={`w-3.5 h-3.5 text-slate-400 ${checkingGitHubUpdate ? 'animate-spin' : ''}`} />
+            )}
+            <span className="hidden sm:inline">
+              {githubUpdateInfo?.hasUpdate
+                ? `有新版本 v${githubUpdateInfo.latestVersion}`
+                : 'GitHub 更新源'}
+            </span>
+          </button>
+
           {/* Simulation / Real badge */}
           {config.mode === 'floci_simulation' ? (
             <button

@@ -47,11 +47,12 @@ export const RestoreModal: React.FC = () => {
   useEffect(() => {
     if (isOpen) {
       const snap = snapshot || snapshots[0];
-      const instName = instance ? instance.name : snap ? snap.fromInstanceName : 'lightsail-instance-1';
+      const instName = instance ? instance.name : snap ? snap.fromInstanceName : 'sing-box-test';
       setSelectedSnapshotName(snap ? snap.name : '');
       setTargetInstanceName(instName);
-      setSelectedBundleId(snap?.fromBundleId || instance?.bundleId || 'micro_2_0');
-      setAvailabilityZone(instance?.location.availabilityZone || 'ap-northeast-1a');
+      setSelectedBundleId(snap?.fromBundleId || instance?.bundleId || 'micro_3_0');
+      const rawAz = instance?.location.availabilityZone;
+      setAvailabilityZone(rawAz && rawAz !== 'all' ? rawAz : 'ap-northeast-1a');
 
       // Setup Cloudflare initial values
       const initialDomain =
@@ -202,10 +203,14 @@ export const RestoreModal: React.FC = () => {
                   disabled={inProgress}
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-indigo-500"
                 >
-                  <option value="nano_2_0">Nano ($3.50/mo, 512MB)</option>
-                  <option value="micro_2_0">Micro ($5.00/mo, 1GB)</option>
-                  <option value="small_2_0">Small ($10.00/mo, 2GB)</option>
-                  <option value="medium_2_0">Medium ($20.00/mo, 4GB)</option>
+                  <option value="nano_3_0">Nano Gen3 ($5/mo, 512MB, 2 vCPU)</option>
+                  <option value="micro_3_0">Micro Gen3 ($7/mo, 1GB, 2 vCPU)</option>
+                  <option value="small_3_0">Small Gen3 ($12/mo, 2GB, 2 vCPU)</option>
+                  <option value="medium_3_0">Medium Gen3 ($24/mo, 4GB, 2 vCPU)</option>
+                  <option value="nano_2_0">Nano Gen2 ($3.50/mo, 512MB, 1 vCPU)</option>
+                  <option value="micro_2_0">Micro Gen2 ($5.00/mo, 1GB, 1 vCPU)</option>
+                  <option value="small_2_0">Small Gen2 ($10.00/mo, 2GB, 1 vCPU)</option>
+                  <option value="medium_2_0">Medium Gen2 ($20.00/mo, 4GB, 2 vCPU)</option>
                 </select>
               </div>
             </div>

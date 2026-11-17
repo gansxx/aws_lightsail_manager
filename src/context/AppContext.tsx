@@ -10,6 +10,9 @@ import {
   ApiLogEntry,
   DiagnosticResult,
   OperationStep,
+  EnvSecretStatus,
+  CredentialTestReport,
+  GitHubUpdateInfo,
 } from '../types/lightsail';
 import { ApiBridge } from '../services/apiBridge';
 import { flociSimulator } from '../services/flociSimulator';
@@ -33,6 +36,12 @@ interface AppContextType {
   scheduleHistory: ScheduleExecutionRecord[];
   diagnostics: DiagnosticResult[];
   toasts: Toast[];
+  envSecretStatus: EnvSecretStatus | null;
+  credentialTestResult: CredentialTestReport | null;
+  testingCredentials: boolean;
+  instanceActionLoading: string | null;
+  githubUpdateInfo: GitHubUpdateInfo | null;
+  checkingGitHubUpdate: boolean;
 
   // Modal controls
   hibernateModal: {
@@ -83,6 +92,12 @@ interface AppContextType {
     onStepUpdate: (index: number, step: OperationStep) => void
   ) => Promise<boolean>;
   executeManualSyncDns: (domain: string, ip: string, zoneId: string, proxied: boolean) => Promise<void>;
+  executeStopInstance: (instance: LightsailInstance) => Promise<void>;
+  executeStartInstance: (instance: LightsailInstance) => Promise<void>;
+  testCurrentCredentials: (overrideConfig?: CloudConfig) => Promise<CredentialTestReport | null>;
+  refreshSecretStatus: () => Promise<void>;
+  checkGitHubUpdate: (overrideRepo?: string, silent?: boolean) => Promise<GitHubUpdateInfo | null>;
+  syncGitHubVersion: () => Promise<void>;
   deleteSnapshot: (snapshotName: string) => Promise<void>;
   runDiagnostics: () => Promise<DiagnosticResult[]>;
   triggerTestHibernateSchedule: (inst: LightsailInstance) => Promise<void>;
@@ -92,19 +107,20 @@ interface AppContextType {
 const AppContext = createContext<AppContextType | null>(null);
 
 const DEFAULT_CONFIG: CloudConfig = {
-  mode: 'floci_simulation',
+  mode: 'real_cloud',
   flociSimulationSpeed: 'normal',
   simulateFaults: {
     awsThrottle: false,
     cloudflareError: false,
     snapshotTimeout: false,
   },
-  awsAccessKeyId: 'AKIAIOSFODNN7EXAMPLE',
-  awsSecretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  awsAccessKeyId: '',
+  awsSecretAccessKey: '',
   awsRegion: 'ap-northeast-1',
-  cloudflareApiToken: 'cf_tok_live_839a9b1837f81a7b',
-  cloudflareZoneId: 'cf-zone-983b8a1e2f',
-  defaultDnsRecordName: 'vpn.mydomain.dev',
+  cloudflareApiToken: '',
+  cloudflareZoneId: '',
+  defaultDnsRecordName: 'test.selfgo.asia',
+  githubRepo: 'gansxx/aws_lightsail_manager',
 };
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -117,6 +133,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [scheduleHistory, setScheduleHistory] = useState<ScheduleExecutionRecord[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticResult[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [envSecretStatus, setEnvSecretStatus] = useState<EnvSecretStatus | null>(null);
+  const [credentialTestResult, setCredentialTestResult] = useState<CredentialTestReport | null>(null);
+  const [testingCredentials, setTestingCredentials] = useState<boolean>(false);
+  const [instanceActionLoading, setInstanceActionLoading] = useState<string | null>(null);
+  const [githubUpdateInfo, setGithubUpdateInfo] = useState<GitHubUpdateInfo | null>(null);
+  const [checkingGitHubUpdate, setCheckingGitHubUpdate] = useState<boolean>(false);
+  const [secretCheckDone, setSecretCheckDone] = useState<boolean>(false);
 
   // Modals
   const [hibernateModal, setHibernateModal] = useState<{ isOpen: boolean; instance: LightsailInstance | null }>({
@@ -142,7 +165,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [config, setConfig] = useState<CloudConfig>(() => {
     try {
       const stored = localStorage.getItem('lightsail_cloud_config');
-      return stored ? { ...DEFAULT_CONFIG, ...JSON.parse(stored) } : DEFAULT_CONFIG;
+      const explicitMode = localStorage.getItem('lightsail_mode_explicit');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return {
+          ...DEFAULT_CONFIG,
+          ...parsed,
+          mode: explicitMode === 'floci_simulation' ? 'floci_simulation' : 'real_cloud',
+        };
+      }
+      return DEFAULT_CONFIG;
     } catch {
       return DEFAULT_CONFIG;
     }
@@ -156,11 +188,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }, 3800);
   }, []);
 
+  const purgeSimulationState = useCallback(() => {
+    setInstances([]);
+    setSnapshots([]);
+    setApiLogs([]);
+    setDiagnostics([]);
+    schedulerService.clearHistory();
+    flociSimulator.clearSimulationStorage();
+  }, []);
+
   const updateConfig = (newConfig: Partial<CloudConfig>) => {
     setConfig((prev) => {
-      const updated = { ...prev, ...newConfig };
+      const hasCustomRealKey = Boolean(
+        (newConfig.awsAccessKeyId && newConfig.awsAccessKeyId.trim()) ||
+          (newConfig.awsSecretAccessKey && newConfig.awsSecretAccessKey.trim()) ||
+          (newConfig.cloudflareApiToken && newConfig.cloudflareApiToken.trim())
+      );
+
+      const nextMode =
+        newConfig.mode || (hasCustomRealKey ? 'real_cloud' : prev.mode);
+
+      const updated: CloudConfig = {
+        ...prev,
+        ...newConfig,
+        mode: nextMode,
+      };
+
+      if (updated.mode === 'real_cloud') {
+        purgeSimulationState();
+      }
+
       try {
         localStorage.setItem('lightsail_cloud_config', JSON.stringify(updated));
+        if (newConfig.mode) {
+          localStorage.setItem('lightsail_mode_explicit', newConfig.mode);
+        }
       } catch {}
       return updated;
     });
@@ -169,6 +231,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const refreshData = useCallback(async () => {
     setLoading(true);
+    if (config.mode === 'real_cloud') {
+      flociSimulator.clearSimulationStorage();
+      const scheduleOverrides = schedulerService.getInstanceScheduleOverrides();
+
+      const [instResult, snapResult] = await Promise.allSettled([
+        ApiBridge.getInstances(config),
+        ApiBridge.getSnapshots(config),
+      ]);
+
+      if (instResult.status === 'fulfilled') {
+        const merged = instResult.value.map((inst) => ({
+          ...inst,
+          autoHibernateSchedule:
+            scheduleOverrides[inst.name]?.autoHibernateSchedule || inst.autoHibernateSchedule,
+          autoStartSchedule:
+            scheduleOverrides[inst.name]?.autoStartSchedule || inst.autoStartSchedule,
+        }));
+        setInstances(merged);
+      } else {
+        setInstances([]);
+        showToast(instResult.reason?.message || '获取真实实例数据失败', 'error');
+      }
+
+      if (snapResult.status === 'fulfilled') {
+        setSnapshots(snapResult.value);
+      } else {
+        setSnapshots([]);
+        if (instResult.status === 'fulfilled') {
+          showToast(snapResult.reason?.message || '获取真实快照数据失败', 'error');
+        }
+      }
+
+      setLoading(false);
+      return;
+    }
+
     try {
       const insts = await ApiBridge.getInstances(config);
       const snaps = await ApiBridge.getSnapshots(config);
@@ -181,8 +279,46 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [config, showToast]);
 
-  // Hook up simulator logs & scheduler history
+  const refreshSecretStatus = useCallback(async () => {
+    try {
+      const status = await ApiBridge.getCredentialStatus();
+      setEnvSecretStatus(status);
+
+      const explicitMode = localStorage.getItem('lightsail_mode_explicit');
+      if (
+        status.awsAccessKeyId.configured &&
+        status.awsSecretAccessKey.configured &&
+        explicitMode !== 'floci_simulation'
+      ) {
+        purgeSimulationState();
+        setConfig((prev) => {
+          const updated: CloudConfig = {
+            ...prev,
+            mode: 'real_cloud',
+            awsRegion: status.awsRegion || prev.awsRegion,
+            defaultDnsRecordName: status.cloudflareRecordName || prev.defaultDnsRecordName,
+          };
+          try {
+            localStorage.setItem('lightsail_cloud_config', JSON.stringify(updated));
+          } catch {}
+          return updated;
+        });
+      }
+    } catch {
+      // Ignore if backend unavailable in static mode
+    } finally {
+      setSecretCheckDone(true);
+    }
+  }, [purgeSimulationState]);
+
   useEffect(() => {
+    refreshSecretStatus();
+  }, [refreshSecretStatus]);
+
+  // Hook up simulator logs & scheduler history once secret check completes
+  useEffect(() => {
+    if (!secretCheckDone) return;
+
     const unsubLogs = flociSimulator.onLog((log) => {
       setApiLogs((prev) => [log, ...prev].slice(0, 100));
     });
@@ -198,7 +334,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubLogs();
       unsubHistory();
     };
-  }, [refreshData]);
+  }, [secretCheckDone, refreshData]);
 
   // Execute Hibernate (Save snapshot -> Delete instance)
   const executeHibernate = async (
@@ -257,6 +393,119 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast(`DNS 同步失败: ${e.message}`, 'error');
     }
   };
+
+  const executeStopInstance = async (instance: LightsailInstance) => {
+    setInstanceActionLoading(instance.name);
+    try {
+      await ApiBridge.stopInstance(instance.name, config);
+      await refreshData();
+      showToast(`实例 ${instance.name} 已停止运行（未删除实例且未创建快照）`, 'info');
+    } catch (e: any) {
+      showToast(`停止实例失败: ${e.message}`, 'error');
+    } finally {
+      setInstanceActionLoading(null);
+    }
+  };
+
+  const executeStartInstance = async (instance: LightsailInstance) => {
+    setInstanceActionLoading(instance.name);
+    try {
+      const res = await ApiBridge.startInstance(instance, config);
+      await refreshData();
+      if (res.publicIpAddress && res.dnsUpdated) {
+        showToast(`实例 ${instance.name} 已启动！新 IP ${res.publicIpAddress} 已同步至 Cloudflare DNS`, 'success');
+      } else if (res.publicIpAddress) {
+        showToast(`实例 ${instance.name} 已启动！公网 IP: ${res.publicIpAddress}`, 'success');
+      } else {
+        showToast(`实例 ${instance.name} 启动指令已发送，请稍后刷新查看新 IP`, 'success');
+      }
+    } catch (e: any) {
+      showToast(`启动实例失败: ${e.message}`, 'error');
+    } finally {
+      setInstanceActionLoading(null);
+    }
+  };
+
+  const testCurrentCredentials = async (overrideConfig?: CloudConfig): Promise<CredentialTestReport | null> => {
+    setTestingCredentials(true);
+    try {
+      const targetConfig = overrideConfig || config;
+      const report = await ApiBridge.testCredentials(targetConfig);
+      setCredentialTestResult(report);
+      await refreshSecretStatus();
+
+      if (report.aws.configured || report.cloudflare.configured) {
+        purgeSimulationState();
+        setConfig((prev) => {
+          const updated: CloudConfig = { ...prev, ...(overrideConfig || {}), mode: 'real_cloud' };
+          try {
+            localStorage.setItem('lightsail_cloud_config', JSON.stringify(updated));
+            localStorage.setItem('lightsail_mode_explicit', 'real_cloud');
+          } catch {}
+          return updated;
+        });
+      }
+
+      if (report.aws.success && report.cloudflare.success) {
+        showToast('AWS 与 Cloudflare 密钥均验证通过，已切换为真实云端数据！', 'success');
+      } else if (report.aws.success || report.cloudflare.success) {
+        showToast('部分密钥验证通过，已清理模拟数据并拉取真实数据', 'warning');
+      } else {
+        showToast('密钥验证未通过，请检查详情', 'error');
+      }
+      return report;
+    } catch (e: any) {
+      showToast(`密钥测试失败: ${e.message}`, 'error');
+      return null;
+    } finally {
+      setTestingCredentials(false);
+    }
+  };
+
+  const checkGitHubUpdate = useCallback(
+    async (overrideRepo?: string, silent?: boolean): Promise<GitHubUpdateInfo | null> => {
+      setCheckingGitHubUpdate(true);
+      try {
+        const repoToCheck = overrideRepo || config.githubRepo || 'gansxx/aws_lightsail_manager';
+        const info = await ApiBridge.checkGitHubUpdate(repoToCheck);
+        setGithubUpdateInfo(info);
+        if (!silent) {
+          if (info.hasUpdate) {
+            showToast(`发现 GitHub 新版本 v${info.latestVersion}（当前 v${info.currentVersion}）`, 'info');
+          } else {
+            showToast(`当前已是最新版本 v${info.currentVersion}`, 'success');
+          }
+        }
+        return info;
+      } catch (e: any) {
+        if (!silent) {
+          showToast(`检查 GitHub 更新失败: ${e.message}`, 'error');
+        }
+        return null;
+      } finally {
+        setCheckingGitHubUpdate(false);
+      }
+    },
+    [config.githubRepo, showToast]
+  );
+
+  const syncGitHubVersion = async () => {
+    if (!githubUpdateInfo?.latestVersion) return;
+    setCheckingGitHubUpdate(true);
+    try {
+      await ApiBridge.syncGitHubVersion(githubUpdateInfo.latestVersion);
+      await checkGitHubUpdate(githubUpdateInfo.repo, true);
+      showToast(`已同步本地版本标识至 v${githubUpdateInfo.latestVersion}`, 'success');
+    } catch (e: any) {
+      showToast(`版本同步失败: ${e.message}`, 'error');
+    } finally {
+      setCheckingGitHubUpdate(false);
+    }
+  };
+
+  useEffect(() => {
+    checkGitHubUpdate(undefined, true);
+  }, [checkGitHubUpdate]);
 
   const deleteSnapshot = async (snapshotName: string) => {
     try {
@@ -318,6 +567,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         scheduleHistory,
         diagnostics,
         toasts,
+        envSecretStatus,
+        credentialTestResult,
+        testingCredentials,
+        instanceActionLoading,
+        githubUpdateInfo,
+        checkingGitHubUpdate,
         hibernateModal,
         restoreModal,
         scheduleModal,
@@ -340,6 +595,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         executeHibernate,
         executeRestore,
         executeManualSyncDns,
+        executeStopInstance,
+        executeStartInstance,
+        testCurrentCredentials,
+        refreshSecretStatus,
+        checkGitHubUpdate,
+        syncGitHubVersion,
         deleteSnapshot,
         runDiagnostics,
         triggerTestHibernateSchedule,

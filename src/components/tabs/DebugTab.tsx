@@ -14,14 +14,18 @@ import {
   XCircle,
   Copy,
   Download,
-  Filter,
   Flame,
   ChevronDown,
   ChevronUp,
   Search,
+  KeyRound,
+  RefreshCw,
+  GitBranch,
+  ExternalLink,
+  ArrowUpCircle,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { ApiLogEntry, DiagnosticResult } from '../../types/lightsail';
+import { ApiLogEntry } from '../../types/lightsail';
 
 export const DebugTab: React.FC = () => {
   const {
@@ -34,6 +38,15 @@ export const DebugTab: React.FC = () => {
     instances,
     snapshots,
     showToast,
+    envSecretStatus,
+    credentialTestResult,
+    testingCredentials,
+    testCurrentCredentials,
+    refreshSecretStatus,
+    githubUpdateInfo,
+    checkingGitHubUpdate,
+    checkGitHubUpdate,
+    syncGitHubVersion,
   } = useApp();
 
   const [serviceFilter, setServiceFilter] = useState<string>('ALL');
@@ -107,16 +120,200 @@ export const DebugTab: React.FC = () => {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-bold text-white tracking-tight">调试与排查中心</h2>
-          <p className="text-slate-400">调用日志流、全链路连通性诊断与异常排查接口</p>
+          <p className="text-slate-400">密钥验证、调用日志流、全链路连通性诊断与异常排查</p>
         </div>
         <button
           onClick={exportDebugBundle}
-          className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors"
+          className="px-2.5 py-2 min-h-[40px] rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
           title="导出调试日志与诊断快照"
         >
           <Download className="w-3.5 h-3.5 text-indigo-400" />
           <span>导出诊断包</span>
         </button>
+      </div>
+
+      {/* Credential & Secrets Verification Suite */}
+      <div className="p-3.5 rounded-2xl bg-indigo-950/20 border border-indigo-800/40 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <KeyRound className="w-4 h-4 text-indigo-400 shrink-0" />
+            <h3 className="font-bold text-white truncate">密钥读取状态与连通性测试</h3>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => refreshSecretStatus()}
+              className="px-2.5 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1 whitespace-nowrap"
+              title="重新读取服务端 Secrets 状态"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>刷新</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => testCurrentCredentials()}
+              disabled={testingCredentials}
+              className="px-3 py-2 min-h-[40px] rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${testingCredentials ? 'animate-spin' : ''}`} />
+              <span>{testingCredentials ? '测试中...' : '测试当前密钥'}</span>
+            </button>
+          </div>
+        </div>
+
+        {envSecretStatus ? (
+          <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+            {[
+              { label: 'AWS_ACCESS_KEY_ID', item: envSecretStatus.awsAccessKeyId },
+              { label: 'AWS_SECRET_ACCESS_KEY', item: envSecretStatus.awsSecretAccessKey },
+              { label: 'CLOUDFLARE_API_TOKEN', item: envSecretStatus.cloudflareApiToken },
+              { label: 'CLOUDFLARE_ZONE_ID', item: envSecretStatus.cloudflareZoneId },
+            ].map((row) => (
+              <div
+                key={row.label}
+                className="p-2 rounded-xl bg-slate-950/75 border border-slate-800 flex flex-col gap-0.5"
+              >
+                <span className="font-mono text-[10px] text-slate-400 truncate">{row.label}</span>
+                {row.item.configured ? (
+                  <span className="text-emerald-300 font-mono flex items-center gap-1 truncate">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                    <span>
+                      {row.item.maskedPreview} ({row.item.length} chars)
+                    </span>
+                  </span>
+                ) : (
+                  <span className="text-amber-300 flex items-center gap-1">
+                    <XCircle className="w-3 h-3 text-amber-400 shrink-0" />
+                    <span>未读取到环境变量</span>
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-[11px] text-slate-400">正在检查服务端 Secrets 读取情况...</p>
+        )}
+
+        {credentialTestResult && (
+          <div className="space-y-2 pt-1">
+            {[
+              { title: 'AWS Lightsail 真实鉴权测试', item: credentialTestResult.aws },
+              { title: 'Cloudflare API 真实鉴权测试', item: credentialTestResult.cloudflare },
+            ].map((entry) => (
+              <div
+                key={entry.title}
+                className={`p-2.5 rounded-xl border flex items-start gap-2.5 ${
+                  entry.item.success
+                    ? 'bg-emerald-950/20 border-emerald-800/40 text-emerald-200'
+                    : 'bg-rose-950/20 border-rose-800/40 text-rose-200'
+                }`}
+              >
+                <div className="mt-0.5 shrink-0">
+                  {entry.item.success ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  ) : (
+                    <XCircle className="w-4 h-4 text-rose-400" />
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="font-semibold text-white">{entry.title}</span>
+                    <span className="text-[10px] font-mono opacity-80">
+                      {entry.item.source === 'env_secret'
+                        ? 'Secrets'
+                        : entry.item.source === 'custom_input'
+                        ? '手动输入'
+                        : '缺失'}{' '}
+                      · HTTP {entry.item.status} · {entry.item.latencyMs}ms
+                    </span>
+                  </div>
+                  <span className="text-[11px] opacity-90 block mt-0.5 break-words">{entry.item.message}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* GitHub Repository Update & Sync Card */}
+      <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <GitBranch className="w-4 h-4 text-indigo-400 shrink-0" />
+            <h3 className="font-bold text-white truncate">GitHub 源版本检查与更新同步</h3>
+          </div>
+          <button
+            type="button"
+            onClick={() => checkGitHubUpdate()}
+            disabled={checkingGitHubUpdate}
+            className="px-3 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 border border-slate-700 font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${checkingGitHubUpdate ? 'animate-spin text-indigo-400' : ''}`} />
+            <span>{checkingGitHubUpdate ? '检查中...' : '检查更新'}</span>
+          </button>
+        </div>
+
+        {githubUpdateInfo ? (
+          <div className="space-y-2 text-[11px]">
+            <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400">源仓库:</span>
+                <span className="font-mono text-slate-200">{githubUpdateInfo.repo}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-white">当前 v{githubUpdateInfo.currentVersion}</span>
+                <span className="text-slate-500">→</span>
+                <span className="font-mono font-bold text-indigo-300">最新 v{githubUpdateInfo.latestVersion}</span>
+              </div>
+            </div>
+
+            {githubUpdateInfo.latestCommit && (
+              <div className="p-2 rounded-xl bg-slate-900/50 border border-slate-800/80 text-slate-300">
+                <span className="font-mono text-indigo-400 mr-1.5">#{githubUpdateInfo.latestCommit.sha}</span>
+                <span>{githubUpdateInfo.latestCommit.message}</span>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2 pt-0.5">
+              {githubUpdateInfo.hasUpdate && (
+                <button
+                  type="button"
+                  onClick={syncGitHubVersion}
+                  disabled={checkingGitHubUpdate}
+                  className="px-3 py-2 min-h-[40px] rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                >
+                  <ArrowUpCircle className="w-3.5 h-3.5" />
+                  <span>同步至 v{githubUpdateInfo.latestVersion}</span>
+                </button>
+              )}
+
+              {githubUpdateInfo.apkAssets.map((apk) => (
+                <a
+                  key={apk.name}
+                  href={apk.downloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-2 min-h-[40px] rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>下载 {apk.name} ({apk.sizeMb} MB)</span>
+                </a>
+              ))}
+
+              <a
+                href={githubUpdateInfo.htmlUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-2 min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition-colors whitespace-nowrap"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+                <span>打开 GitHub Releases</span>
+              </a>
+            </div>
+          </div>
+        ) : (
+          <p className="text-[11px] text-slate-400">正在同步 GitHub 源仓库版本信息...</p>
+        )}
       </div>
 
       {/* Diagnostic Health Check Suite */}

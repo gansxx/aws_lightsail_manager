@@ -265,11 +265,23 @@ export class FlociSimulatorEngine {
     this.saveState();
   }
 
+  public clearSimulationStorage() {
+    try {
+      localStorage.removeItem('floci_instances');
+      localStorage.removeItem('floci_snapshots');
+      localStorage.removeItem('floci_cf_records');
+    } catch {}
+  }
+
   public onLog(listener: (log: ApiLogEntry) => void) {
     this.logListeners.push(listener);
     return () => {
       this.logListeners = this.logListeners.filter((l) => l !== listener);
     };
+  }
+
+  public recordExternalLog(log: Omit<ApiLogEntry, 'id' | 'timestamp'>) {
+    this.emitLog(log);
   }
 
   private emitLog(log: Omit<ApiLogEntry, 'id' | 'timestamp'>) {
@@ -449,6 +461,113 @@ export class FlociSimulatorEngine {
     });
 
     return true;
+  }
+
+  /**
+   * Stop instance (Power off only: does NOT delete instance and does NOT create snapshot)
+   */
+  public async stopInstance(instanceName: string, config: CloudConfig): Promise<LightsailInstance> {
+    const start = performance.now();
+    const inst = this.instances.find((i) => i.name === instanceName);
+    if (!inst) {
+      throw new Error(`Instance '${instanceName}' not found`);
+    }
+    if (inst.state === 'hibernated') {
+      throw new Error(`实例 '${instanceName}' 当前已休眠删除，请使用从快照恢复启动`);
+    }
+
+    if (config.simulateFaults.awsThrottle) {
+      this.emitLog({
+        service: 'AWS_LIGHTSAIL',
+        method: 'POST',
+        action: 'StopInstance',
+        endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+        requestPayload: { instanceName },
+        status: 429,
+        latencyMs: Math.round(performance.now() - start),
+        success: false,
+        errorMessage: 'ClientError: Rate exceeded (HTTP 429 TooManyRequests)',
+      });
+      throw new Error('AWS Error (429): Rate exceeded. Floci throttle simulation triggered.');
+    }
+
+    const delay = config.flociSimulationSpeed === 'instant' ? 60 : config.flociSimulationSpeed === 'slow' ? 500 : 220;
+    await new Promise((r) => setTimeout(r, delay));
+
+    inst.state = 'stopped';
+    inst.publicIpAddress = null;
+    this.saveState();
+
+    this.emitLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'StopInstance',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName },
+      responsePayload: {
+        operations: [{ status: 'Succeeded', operationType: 'StopInstance' }],
+        note: 'Instance stopped cleanly without creating snapshot or deleting resource.',
+      },
+      status: 200,
+      latencyMs: Math.round(performance.now() - start),
+      success: true,
+    });
+
+    return JSON.parse(JSON.stringify(inst));
+  }
+
+  /**
+   * Start stopped instance (Power on only: does NOT restore from snapshot)
+   */
+  public async startInstance(instanceName: string, config: CloudConfig): Promise<LightsailInstance> {
+    const start = performance.now();
+    const inst = this.instances.find((i) => i.name === instanceName);
+    if (!inst) {
+      throw new Error(`Instance '${instanceName}' not found`);
+    }
+    if (inst.state === 'hibernated') {
+      throw new Error(`实例 '${instanceName}' 处于已休眠状态，请通过快照恢复唤醒`);
+    }
+
+    if (config.simulateFaults.awsThrottle) {
+      this.emitLog({
+        service: 'AWS_LIGHTSAIL',
+        method: 'POST',
+        action: 'StartInstance',
+        endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+        requestPayload: { instanceName },
+        status: 429,
+        latencyMs: Math.round(performance.now() - start),
+        success: false,
+        errorMessage: 'ClientError: Rate exceeded (HTTP 429 TooManyRequests)',
+      });
+      throw new Error('AWS Error (429): Rate exceeded. Floci throttle simulation triggered.');
+    }
+
+    const delay = config.flociSimulationSpeed === 'instant' ? 80 : config.flociSimulationSpeed === 'slow' ? 600 : 280;
+    await new Promise((r) => setTimeout(r, delay));
+
+    const freshPublicIp = getRandomAwsPublicIp();
+    inst.state = 'running';
+    inst.publicIpAddress = freshPublicIp;
+    this.saveState();
+
+    this.emitLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'StartInstance',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName },
+      responsePayload: {
+        operations: [{ status: 'Succeeded', operationType: 'StartInstance' }],
+        instance: { name: inst.name, state: 'running', publicIpAddress: freshPublicIp },
+      },
+      status: 200,
+      latencyMs: Math.round(performance.now() - start),
+      success: true,
+    });
+
+    return JSON.parse(JSON.stringify(inst));
   }
 
   /**

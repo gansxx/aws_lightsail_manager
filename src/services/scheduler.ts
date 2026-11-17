@@ -70,6 +70,34 @@ export class SchedulerService {
     }, 30000);
   }
 
+  public saveInstanceScheduleOverride(
+    instanceName: string,
+    autoHibernateSchedule?: LightsailInstance['autoHibernateSchedule'],
+    autoStartSchedule?: LightsailInstance['autoStartSchedule']
+  ) {
+    try {
+      const raw = localStorage.getItem('lightsail_instance_schedules');
+      const map = raw ? JSON.parse(raw) : {};
+      map[instanceName] = { autoHibernateSchedule, autoStartSchedule };
+      localStorage.setItem('lightsail_instance_schedules', JSON.stringify(map));
+    } catch {}
+  }
+
+  public getInstanceScheduleOverrides(): Record<
+    string,
+    {
+      autoHibernateSchedule?: LightsailInstance['autoHibernateSchedule'];
+      autoStartSchedule?: LightsailInstance['autoStartSchedule'];
+    }
+  > {
+    try {
+      const raw = localStorage.getItem('lightsail_instance_schedules');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+
   /**
    * Check if any instance's scheduled time has arrived
    */
@@ -89,7 +117,27 @@ export class SchedulerService {
           defaultDnsRecordName: '',
         };
 
-    const instances = await flociSimulator.getInstances(config);
+    let instances: LightsailInstance[] = [];
+    if (config.mode === 'floci_simulation') {
+      instances = await flociSimulator.getInstances(config);
+    } else {
+      const overrides = this.getInstanceScheduleOverrides();
+      const hasAnyEnabled = Object.values(overrides).some(
+        (o) => o?.autoHibernateSchedule?.enabled || o?.autoStartSchedule?.enabled
+      );
+      if (!hasAnyEnabled) return;
+      try {
+        const realInsts = await ApiBridge.getInstances(config);
+        instances = realInsts.map((inst) => ({
+          ...inst,
+          autoHibernateSchedule: overrides[inst.name]?.autoHibernateSchedule || inst.autoHibernateSchedule,
+          autoStartSchedule: overrides[inst.name]?.autoStartSchedule || inst.autoStartSchedule,
+        }));
+      } catch {
+        return;
+      }
+    }
+
     const now = new Date();
     const currentHours = String(now.getHours()).padStart(2, '0');
     const currentMinutes = String(now.getMinutes()).padStart(2, '0');

@@ -137,6 +137,9 @@ export interface CloudConfig {
   cloudflareApiToken: string;
   cloudflareZoneId: string;
   defaultDnsRecordName: string;
+
+  // GitHub Update Source
+  githubRepo?: string;
 }
 
 export interface OperationStep {
@@ -146,3 +149,65 @@ export interface OperationStep {
   status: 'pending' | 'running' | 'completed' | 'error';
   detail?: string;
 }
+
+export interface SecretFieldStatus {
+  configured: boolean;
+  maskedPreview: string | null;
+  length: number;
+}
+
+export interface EnvSecretStatus {
+  awsAccessKeyId: SecretFieldStatus;
+  awsSecretAccessKey: SecretFieldStatus;
+  awsRegion: string;
+  cloudflareApiToken: SecretFieldStatus;
+  cloudflareZoneId: SecretFieldStatus;
+  cloudflareRecordName: string | null;
+}
+
+export interface CredentialCheckItem {
+  configured: boolean;
+  source: 'env_secret' | 'custom_input' | 'missing';
+  success: boolean;
+  status: number;
+  latencyMs: number;
+  message: string;
+  details?: Record<string, any>;
+}
+
+export interface CredentialTestReport {
+  timestamp: string;
+  aws: CredentialCheckItem;
+  cloudflare: CredentialCheckItem;
+}
+
+export interface GitHubReleaseAsset {
+  name: string;
+  downloadUrl: string;
+  sizeBytes: number;
+  sizeMb: string;
+  downloadCount: number;
+}
+
+export interface GitHubUpdateInfo {
+  repo: string;
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseTag: string | null;
+  releaseName: string | null;
+  releaseNotes: string | null;
+  publishedAt: string | null;
+  htmlUrl: string;
+  apkAssets: GitHubReleaseAsset[];
+  latestCommit: {
+    sha: string;
+    message: string;
+    date: string;
+    author: string;
+    url: string;
+  } | null;
+  checkedAt: string;
+}
+
+
