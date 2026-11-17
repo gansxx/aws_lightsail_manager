@@ -9,7 +9,17 @@ import {
   CloudflareDnsRecord,
   ApiLogEntry,
   CloudConfig,
+  FirewallPortRule,
+  SnapshotLifecyclePolicy,
 } from '../types/lightsail';
+
+export const DEFAULT_SIM_FIREWALL_RULES: FirewallPortRule[] = [
+  { fromPort: 22, toPort: 22, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'SSH' },
+  { fromPort: 80, toPort: 80, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'HTTP' },
+  { fromPort: 443, toPort: 443, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'HTTPS' },
+  { fromPort: 2080, toPort: 2080, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'Sing-box TCP' },
+  { fromPort: 2080, toPort: 2080, protocol: 'udp', cidrs: ['0.0.0.0/0'], commonName: 'Sing-box UDP' },
+];
 
 // Pre-seeded initial instances
 const INITIAL_INSTANCES: LightsailInstance[] = [
@@ -34,6 +44,8 @@ const INITIAL_INSTANCES: LightsailInstance[] = [
     createdAt: '2026-10-15T08:00:00Z',
     keyPairName: 'id_ed25519_tokyo',
     tags: [{ key: 'Environment', value: 'Production' }, { key: 'Role', value: 'VPN' }],
+    firewallRules: DEFAULT_SIM_FIREWALL_RULES,
+    firewallExtractedAt: '2026-11-09T14:20:00Z',
     cloudflareBinding: {
       enabled: true,
       domain: 'vpn.mydomain.dev',
@@ -75,6 +87,12 @@ const INITIAL_INSTANCES: LightsailInstance[] = [
     createdAt: '2026-10-28T12:30:00Z',
     keyPairName: 'id_rsa_oregon',
     tags: [{ key: 'Environment', value: 'Development' }],
+    firewallRules: [
+      { fromPort: 22, toPort: 22, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'SSH' },
+      { fromPort: 443, toPort: 443, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'HTTPS' },
+      { fromPort: 3000, toPort: 3000, protocol: 'tcp', cidrs: ['0.0.0.0/0'], commonName: 'Node API' },
+    ],
+    firewallExtractedAt: '2026-11-08T09:15:00Z',
     cloudflareBinding: {
       enabled: true,
       domain: 'api-dev.mydomain.dev',
@@ -116,6 +134,8 @@ const INITIAL_INSTANCES: LightsailInstance[] = [
     createdAt: '2026-11-01T04:12:00Z',
     lastSnapshotName: 'snap-staging-auto-saved-1109',
     lastSnapshotTime: '2026-11-09T22:00:15Z',
+    firewallRules: DEFAULT_SIM_FIREWALL_RULES,
+    firewallExtractedAt: '2026-11-09T22:00:15Z',
     cloudflareBinding: {
       enabled: true,
       domain: 'stage.mydomain.dev',
@@ -141,12 +161,15 @@ const INITIAL_SNAPSHOTS: LightsailSnapshot[] = [
     state: 'available',
     createdAt: '2026-11-09T22:00:15Z',
     isAutoHibernateSnapshot: true,
+    isProtectedHibernatedBase: true,
+    autoDeleteAt: null,
     preservedConfig: {
       blueprintId: 'almalinux_9',
       bundleId: 'nano_2_0',
       availabilityZone: 'ap-northeast-1a',
       cloudflareDomain: 'stage.mydomain.dev',
       tags: [{ key: 'Environment', value: 'Staging' }],
+      firewallRules: DEFAULT_SIM_FIREWALL_RULES,
     },
   },
   {
@@ -160,11 +183,14 @@ const INITIAL_SNAPSHOTS: LightsailSnapshot[] = [
     state: 'available',
     createdAt: '2026-11-05T10:14:00Z',
     isAutoHibernateSnapshot: false,
+    isProtectedHibernatedBase: false,
+    autoDeleteAt: null,
     preservedConfig: {
       blueprintId: 'ubuntu_22_04',
       bundleId: 'micro_2_0',
       availabilityZone: 'ap-northeast-1a',
       cloudflareDomain: 'vpn.mydomain.dev',
+      firewallRules: DEFAULT_SIM_FIREWALL_RULES,
     },
   },
 ];
@@ -350,13 +376,110 @@ export class FlociSimulatorEngine {
   }
 
   /**
+   * Extract & persist firewall rules for an instance (Step 1 of Hibernate)
+   */
+  public async extractFirewallRules(
+    instanceName: string,
+    snapshotName: string | undefined,
+    config: CloudConfig,
+    customRules?: FirewallPortRule[]
+  ): Promise<FirewallPortRule[]> {
+    const start = performance.now();
+    const target = this.instances.find((i) => i.name === instanceName);
+    const rules: FirewallPortRule[] =
+      customRules && customRules.length > 0
+        ? customRules
+        : target?.firewallRules && target.firewallRules.length > 0
+        ? target.firewallRules
+        : DEFAULT_SIM_FIREWALL_RULES;
+
+    const nowIso = new Date().toISOString();
+    if (target) {
+      target.firewallRules = rules;
+      target.firewallExtractedAt = nowIso;
+    }
+    if (snapshotName) {
+      const snap = this.snapshots.find((s) => s.name === snapshotName);
+      if (snap) {
+        snap.preservedConfig = {
+          ...(snap.preservedConfig || {
+            blueprintId: snap.fromBlueprintId,
+            bundleId: snap.fromBundleId,
+            availabilityZone: 'ap-northeast-1a',
+          }),
+          firewallRules: rules,
+        };
+      }
+    }
+    this.saveState();
+
+    this.emitLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'GetInstancePortStates',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName },
+      responsePayload: { portStates: rules },
+      status: 200,
+      latencyMs: Math.round(performance.now() - start),
+      success: true,
+    });
+
+    return JSON.parse(JSON.stringify(rules));
+  }
+
+  /**
+   * Restore firewall rules to an instance via PutInstancePublicPorts
+   */
+  public async restoreFirewallRules(
+    instanceName: string,
+    snapshotName: string | undefined,
+    config: CloudConfig,
+    customRules?: FirewallPortRule[]
+  ): Promise<FirewallPortRule[]> {
+    const start = performance.now();
+    const target = this.instances.find((i) => i.name === instanceName);
+    const snap = snapshotName ? this.snapshots.find((s) => s.name === snapshotName) : undefined;
+
+    const rules: FirewallPortRule[] =
+      customRules && customRules.length > 0
+        ? customRules
+        : snap?.preservedConfig?.firewallRules && snap.preservedConfig.firewallRules.length > 0
+        ? snap.preservedConfig.firewallRules
+        : target?.firewallRules && target.firewallRules.length > 0
+        ? target.firewallRules
+        : DEFAULT_SIM_FIREWALL_RULES;
+
+    if (target) {
+      target.firewallRules = rules;
+      target.firewallExtractedAt = new Date().toISOString();
+      this.saveState();
+    }
+
+    this.emitLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'PutInstancePublicPorts',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName, portInfos: rules },
+      responsePayload: { operations: [{ status: 'Succeeded', operationType: 'PutInstancePublicPorts' }] },
+      status: 200,
+      latencyMs: Math.round(performance.now() - start),
+      success: true,
+    });
+
+    return JSON.parse(JSON.stringify(rules));
+  }
+
+  /**
    * Create snapshot for instance
    */
   public async createInstanceSnapshot(
     instanceName: string,
     snapshotName: string,
     config: CloudConfig,
-    isAutoHibernate = false
+    isAutoHibernate = false,
+    retentionHours?: number | null
   ): Promise<LightsailSnapshot> {
     const start = performance.now();
     const target = this.instances.find((i) => i.name === instanceName);
@@ -379,6 +502,11 @@ export class FlociSimulatorEngine {
       throw new Error('AWS Error (504): Snapshot creation timed out. Simulated fault.');
     }
 
+    const autoDeleteAt =
+      retentionHours && retentionHours > 0
+        ? new Date(Date.now() + retentionHours * 3600_000).toISOString()
+        : null;
+
     const newSnapshot: LightsailSnapshot = {
       name: snapshotName,
       arn: `arn:aws:lightsail:${target.location.availabilityZone.slice(0, -1)}:123456789012:InstanceSnapshot/${snapshotName}`,
@@ -391,12 +519,18 @@ export class FlociSimulatorEngine {
       progress: '100%',
       createdAt: new Date().toISOString(),
       isAutoHibernateSnapshot: isAutoHibernate,
+      autoDeleteAt,
+      isProtectedHibernatedBase: isAutoHibernate,
       preservedConfig: {
         blueprintId: target.blueprintId,
         bundleId: target.bundleId,
         availabilityZone: target.location.availabilityZone,
         cloudflareDomain: target.cloudflareBinding?.domain,
         tags: target.tags,
+        firewallRules:
+          target.firewallRules && target.firewallRules.length > 0
+            ? target.firewallRules
+            : DEFAULT_SIM_FIREWALL_RULES,
       },
     };
 
@@ -591,6 +725,10 @@ export class FlociSimulatorEngine {
     const freshPrivateIp = '172.26.' + Math.floor(Math.random() * 254) + '.' + Math.floor(Math.random() * 254);
 
     let instance = this.instances.find((i) => i.name === instanceName);
+    const preservedFirewall =
+      snap.preservedConfig?.firewallRules && snap.preservedConfig.firewallRules.length > 0
+        ? snap.preservedConfig.firewallRules
+        : instance?.firewallRules || DEFAULT_SIM_FIREWALL_RULES;
 
     if (instance) {
       // Waking up hibernated instance
@@ -599,6 +737,8 @@ export class FlociSimulatorEngine {
       instance.privateIpAddress = freshPrivateIp;
       instance.bundleId = bundleId || snap.fromBundleId;
       instance.createdAt = new Date().toISOString();
+      instance.firewallRules = preservedFirewall;
+      instance.firewallExtractedAt = new Date().toISOString();
     } else {
       // Creating as brand new restored instance
       instance = {
@@ -621,6 +761,8 @@ export class FlociSimulatorEngine {
         },
         createdAt: new Date().toISOString(),
         tags: snap.preservedConfig?.tags || [],
+        firewallRules: preservedFirewall,
+        firewallExtractedAt: new Date().toISOString(),
         cloudflareBinding: snap.preservedConfig?.cloudflareDomain
           ? {
               enabled: true,
@@ -658,6 +800,61 @@ export class FlociSimulatorEngine {
     });
 
     return instance;
+  }
+
+  public setSnapshotRetention(snapshotName: string, autoDeleteAt: string | null) {
+    const snap = this.snapshots.find((s) => s.name === snapshotName);
+    if (snap) {
+      snap.autoDeleteAt = autoDeleteAt;
+      this.saveState();
+    }
+  }
+
+  public async cleanupExpiredSnapshots(
+    policy: SnapshotLifecyclePolicy,
+    config: CloudConfig
+  ): Promise<{
+    checkedCount: number;
+    deletedSnapshots: Array<{ name: string; reason: string }>;
+    skippedProtected: Array<{ name: string; reason: string }>;
+  }> {
+    const checkedCount = this.snapshots.length;
+    const deletedSnapshots: Array<{ name: string; reason: string }> = [];
+    const skippedProtected: Array<{ name: string; reason: string }> = [];
+    const nowMs = Date.now();
+
+    const hibernatedNames = new Set(
+      this.instances.filter((i) => i.state === 'hibernated').map((i) => i.name)
+    );
+    const protectedSnapNames = new Set<string>();
+    if (policy.protectLatestHibernatedSnapshot) {
+      for (const hName of hibernatedNames) {
+        const latest = this.snapshots.find((s) => s.fromInstanceName === hName);
+        if (latest) protectedSnapNames.add(latest.name);
+      }
+    }
+
+    for (const snap of [...this.snapshots]) {
+      if (snap.autoDeleteAt) {
+        const exp = new Date(snap.autoDeleteAt).getTime();
+        if (!Number.isNaN(exp) && exp <= nowMs) {
+          if (protectedSnapNames.has(snap.name)) {
+            skippedProtected.push({
+              name: snap.name,
+              reason: '休眠实例唯一最新基础镜像，受保护跳过',
+            });
+          } else {
+            await this.deleteSnapshot(snap.name, config);
+            deletedSnapshots.push({
+              name: snap.name,
+              reason: `已到达设定过期时间 (${snap.autoDeleteAt})`,
+            });
+          }
+        }
+      }
+    }
+
+    return { checkedCount, deletedSnapshots, skippedProtected };
   }
 
   public async deleteSnapshot(snapshotName: string, config: CloudConfig): Promise<boolean> {

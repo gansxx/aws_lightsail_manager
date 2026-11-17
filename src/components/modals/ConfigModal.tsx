@@ -39,20 +39,23 @@ export const ConfigModal: React.FC = () => {
     checkingGitHubUpdate,
     checkGitHubUpdate,
     syncGitHubVersion,
+    updateInstanceDomain,
   } = useApp();
 
   const [form, setForm] = useState<CloudConfig>(config);
+  const wasOpenRef = React.useRef<boolean>(false);
 
   React.useEffect(() => {
-    setForm(config);
-    if (configModalOpen) {
+    if (configModalOpen && !wasOpenRef.current) {
+      setForm(config);
       refreshSecretStatus();
     }
+    wasOpenRef.current = configModalOpen;
   }, [config, configModalOpen, refreshSecretStatus]);
 
   if (!configModalOpen) return null;
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const hasCustomInput = Boolean(
       form.awsAccessKeyId.trim() ||
         form.awsSecretAccessKey.trim() ||
@@ -60,6 +63,9 @@ export const ConfigModal: React.FC = () => {
     );
     const nextForm: CloudConfig = hasCustomInput ? { ...form, mode: 'real_cloud' } : form;
     updateConfig(nextForm);
+    if (nextForm.defaultDnsRecordName.trim()) {
+      await updateInstanceDomain(nextForm.defaultDnsRecordName.trim());
+    }
     setConfigModalOpen(false);
   };
 
@@ -413,14 +419,28 @@ export const ConfigModal: React.FC = () => {
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">默认解析域名:</label>
-                  <input
-                    type="text"
-                    value={form.defaultDnsRecordName}
-                    onChange={(e) => setForm((prev) => ({ ...prev, defaultDnsRecordName: e.target.value }))}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs"
-                    placeholder="留空读取 CLOUDFLARE_RECORD_NAME"
-                  />
+                  <label className="block text-slate-400 mb-1">默认解析域名 (可随时修改):</label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={form.defaultDnsRecordName}
+                      onChange={(e) => setForm((prev) => ({ ...prev, defaultDnsRecordName: e.target.value }))}
+                      className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 font-mono text-white text-xs focus:border-indigo-500 focus:outline-none"
+                      placeholder="例如 vpn.selfgo.asia"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (form.defaultDnsRecordName.trim()) {
+                          updateInstanceDomain(form.defaultDnsRecordName.trim());
+                        }
+                      }}
+                      className="px-2.5 py-2 rounded-lg bg-amber-600/25 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 text-[11px] font-medium whitespace-nowrap shrink-0"
+                      title="立即应用并覆盖默认解析域名"
+                    >
+                      应用
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

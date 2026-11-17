@@ -13,10 +13,13 @@ import {
   ShieldCheck,
   GitBranch,
   ArrowUpCircle,
+  Layers,
+  Loader2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { AndroidStatusBar } from './AndroidStatusBar';
 import { AndroidBottomNav } from './AndroidBottomNav';
+import { BackgroundTaskPanel } from './BackgroundTaskPanel';
 
 export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const {
@@ -31,10 +34,14 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
     githubUpdateInfo,
     checkingGitHubUpdate,
     checkGitHubUpdate,
+    backgroundTasks,
+    taskDrawerOpen,
+    setTaskDrawerOpen,
   } = useApp();
 
   const hibernatedCount = instances.filter((i) => i.state === 'hibernated').length;
   const runningCount = instances.filter((i) => i.state === 'running').length;
+  const activeBgCount = backgroundTasks.filter((t) => t.status === 'running').length;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -59,6 +66,30 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
 
         {/* Action Controls */}
         <div className="flex items-center gap-2">
+          {/* Background Task Queue Status Button */}
+          {backgroundTasks.length > 0 && (
+            <button
+              onClick={() => setTaskDrawerOpen(!taskDrawerOpen)}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border transition-colors whitespace-nowrap ${
+                activeBgCount > 0
+                  ? 'bg-indigo-600/25 border-indigo-500/60 text-indigo-200 hover:bg-indigo-600/35'
+                  : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+              }`}
+              title="查看后台长耗时任务执行进度"
+            >
+              {activeBgCount > 0 ? (
+                <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />
+              ) : (
+                <Layers className="w-3.5 h-3.5 text-emerald-400" />
+              )}
+              <span>
+                {activeBgCount > 0
+                  ? `后台任务 (${activeBgCount} 运行中)`
+                  : `任务队列 (${backgroundTasks.length})`}
+              </span>
+            </button>
+          )}
+
           {/* GitHub Update Check Button */}
           <button
             onClick={() => {
@@ -178,6 +209,7 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
 
             {/* Scrollable Screen Content */}
             <div className="flex-1 overflow-y-auto overflow-x-hidden relative flex flex-col bg-slate-900">
+              <BackgroundTaskPanel />
               {children}
             </div>
 
@@ -194,6 +226,7 @@ export const AndroidFrame: React.FC<{ children: React.ReactNode }> = ({ children
           <div className="w-full max-w-5xl h-[88vh] bg-slate-900 rounded-2xl shadow-xl border border-slate-800 flex flex-col overflow-hidden">
             <AndroidStatusBar />
             <div className="flex-1 overflow-y-auto overflow-x-hidden relative bg-slate-900">
+              <BackgroundTaskPanel />
               {children}
             </div>
             <AndroidBottomNav />

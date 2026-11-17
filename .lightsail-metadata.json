@@ -1,0 +1,170 @@
+{
+  "firewallByInstance": {
+    "sing-box-test": {
+      "rules": [
+        {
+          "fromPort": 80,
+          "toPort": 80,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "HTTP"
+        },
+        {
+          "fromPort": 8080,
+          "toPort": 8080,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "Custom TCP 8080"
+        },
+        {
+          "fromPort": 10000,
+          "toPort": 65535,
+          "protocol": "udp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "Range 10000-65535"
+        },
+        {
+          "fromPort": 22,
+          "toPort": 22,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "SSH"
+        }
+      ],
+      "updatedAt": "2026-11-17T12:15:18.876Z"
+    }
+  },
+  "firewallBySnapshot": {
+    "sing-box-test-1794904390": {
+      "rules": [
+        {
+          "fromPort": 80,
+          "toPort": 80,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "HTTP"
+        },
+        {
+          "fromPort": 10000,
+          "toPort": 65535,
+          "protocol": "udp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "Range 10000-65535"
+        },
+        {
+          "fromPort": 22,
+          "toPort": 22,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "SSH"
+        }
+      ],
+      "updatedAt": "2026-11-17T11:39:09.660Z"
+    },
+    "snap-sing-box-test-20261117-1949": {
+      "rules": [
+        {
+          "fromPort": 80,
+          "toPort": 80,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "HTTP"
+        },
+        {
+          "fromPort": 8080,
+          "toPort": 8080,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "Custom TCP 8080"
+        },
+        {
+          "fromPort": 10000,
+          "toPort": 65535,
+          "protocol": "udp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "Range 10000-65535"
+        },
+        {
+          "fromPort": 22,
+          "toPort": 22,
+          "protocol": "tcp",
+          "cidrs": [
+            "0.0.0.0/0"
+          ],
+          "ipv6Cidrs": [
+            "::/0"
+          ],
+          "commonName": "SSH"
+        }
+      ],
+      "updatedAt": "2026-11-17T12:15:18.876Z"
+    }
+  },
+  "snapshotAutoDeleteAt": {
+    "snap-sing-box-test-20261117-1830": "2026-11-24T11:36:14.950Z",
+    "sing-box-test-1794904390": null
+  },
+  "lifecyclePolicy": {
+    "enabled": true,
+    "defaultRetentionHours": 168,
+    "maxSnapshotsPerInstance": 3,
+    "protectLatestHibernatedSnapshot": true,
+    "lastCleanupTime": "2026-11-17T12:17:12.603Z",
+    "lastDeletedCount": 0
+  },
+  "customDefaultDnsRecordName": "jiasu.selfgo.asia",
+  "domainByInstance": {
+    "sing-box-test": "jiasu.selfgo.asia"
+  },
+  "backgroundTasks": []
+}

@@ -13,6 +13,9 @@ import {
   EnvSecretStatus,
   CredentialTestReport,
   GitHubUpdateInfo,
+  FirewallPortRule,
+  SnapshotLifecyclePolicy,
+  BackgroundTask,
 } from '../types/lightsail';
 import { flociSimulator } from './flociSimulator';
 
@@ -203,6 +206,247 @@ export class ApiBridge {
   }
 
   /**
+   * Extract & persist instance firewall configuration
+   */
+  public static async extractFirewallRules(
+    instanceName: string,
+    snapshotName: string | undefined,
+    config: CloudConfig,
+    customRules?: FirewallPortRule[]
+  ): Promise<{ rules: FirewallPortRule[]; extractedAt: string; source: string }> {
+    if (config.mode === 'floci_simulation') {
+      const rules = await flociSimulator.extractFirewallRules(
+        instanceName,
+        snapshotName,
+        config,
+        customRules
+      );
+      return {
+        rules,
+        extractedAt: new Date().toISOString(),
+        source: 'floci_simulation',
+      };
+    }
+
+    const data = await postJson<{
+      success: boolean;
+      instanceName: string;
+      rules: FirewallPortRule[];
+      extractedAt: string;
+      source: string;
+      latencyMs: number;
+      endpoint: string;
+    }>('/api/lightsail/firewall/extract', {
+      instanceName,
+      snapshotName,
+      customRules,
+      config,
+    });
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'GetInstancePortStates (Extract Firewall)',
+      endpoint: data.endpoint,
+      requestPayload: { instanceName, snapshotName },
+      responsePayload: { rulesCount: data.rules.length, source: data.source, rules: data.rules },
+      status: 200,
+      latencyMs: data.latencyMs,
+      success: true,
+    });
+
+    return {
+      rules: data.rules,
+      extractedAt: data.extractedAt,
+      source: data.source,
+    };
+  }
+
+  /**
+   * Save or update firewall rules for an instance / snapshot (and optionally apply live)
+   */
+  public static async saveFirewallRules(
+    instanceName: string,
+    snapshotName: string | undefined,
+    rules: FirewallPortRule[],
+    applyToRunningInstance: boolean,
+    config: CloudConfig
+  ): Promise<FirewallPortRule[]> {
+    if (config.mode === 'floci_simulation') {
+      return flociSimulator.extractFirewallRules(instanceName, snapshotName, config, rules);
+    }
+
+    const data = await postJson<{
+      success: boolean;
+      rules: FirewallPortRule[];
+      appliedToCloud: boolean;
+      latencyMs: number;
+      endpoint: string;
+    }>('/api/lightsail/firewall/save', {
+      instanceName,
+      snapshotName,
+      rules,
+      applyToRunningInstance,
+      config,
+    });
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: applyToRunningInstance
+        ? 'PutInstancePublicPorts (Apply & Save Firewall)'
+        : 'SavePreservedFirewallConfig',
+      endpoint: data.endpoint,
+      requestPayload: { instanceName, snapshotName, rulesCount: rules.length },
+      responsePayload: { appliedToCloud: data.appliedToCloud, rules: data.rules },
+      status: 200,
+      latencyMs: data.latencyMs,
+      success: true,
+    });
+
+    return data.rules;
+  }
+
+  /**
+   * Restore firewall rules to a running/restored instance via PutInstancePublicPorts
+   */
+  public static async restoreFirewallRules(
+    instanceName: string,
+    snapshotName: string | undefined,
+    config: CloudConfig,
+    customRules?: FirewallPortRule[]
+  ): Promise<FirewallPortRule[]> {
+    if (config.mode === 'floci_simulation') {
+      return flociSimulator.restoreFirewallRules(instanceName, snapshotName, config, customRules);
+    }
+
+    const data = await postJson<{
+      success: boolean;
+      restoredRules: FirewallPortRule[];
+      latencyMs: number;
+      endpoint: string;
+    }>('/api/lightsail/firewall/restore', {
+      instanceName,
+      snapshotName,
+      rules: customRules,
+      config,
+    });
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'PutInstancePublicPorts (Restore Firewall)',
+      endpoint: data.endpoint,
+      requestPayload: { instanceName, snapshotName, portCount: data.restoredRules.length },
+      responsePayload: { restoredRules: data.restoredRules },
+      status: 200,
+      latencyMs: data.latencyMs,
+      success: true,
+    });
+
+    return data.restoredRules;
+  }
+
+  /**
+   * Snapshot Lifecycle Policy & Auto-Delete Management
+   */
+  public static async getSnapshotLifecyclePolicy(): Promise<SnapshotLifecyclePolicy> {
+    try {
+      const res = await fetch('/api/lightsail/snapshots/lifecycle');
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.policy) return data.policy as SnapshotLifecyclePolicy;
+      }
+    } catch {}
+    return {
+      enabled: true,
+      defaultRetentionHours: 168,
+      maxSnapshotsPerInstance: 3,
+      protectLatestHibernatedSnapshot: true,
+    };
+  }
+
+  public static async updateSnapshotLifecyclePolicy(
+    policy: Partial<SnapshotLifecyclePolicy>,
+    applyToExistingSnapshots: boolean,
+    config: CloudConfig
+  ): Promise<SnapshotLifecyclePolicy> {
+    const data = await postJson<{ success: boolean; policy: SnapshotLifecyclePolicy }>(
+      '/api/lightsail/snapshots/lifecycle',
+      { policy, applyToExistingSnapshots, config }
+    );
+    return data.policy;
+  }
+
+  public static async setSnapshotRetention(
+    snapshotName: string,
+    retentionHours: number | null | undefined,
+    autoDeleteAt: string | null | undefined,
+    config: CloudConfig
+  ): Promise<string | null> {
+    if (config.mode === 'floci_simulation') {
+      const resolved =
+        retentionHours !== undefined
+          ? retentionHours && retentionHours > 0
+            ? new Date(Date.now() + retentionHours * 3600_000).toISOString()
+            : null
+          : autoDeleteAt || null;
+      flociSimulator.setSnapshotRetention(snapshotName, resolved);
+      return resolved;
+    }
+
+    const data = await postJson<{ success: boolean; snapshotName: string; autoDeleteAt: string | null }>(
+      '/api/lightsail/snapshots/retention',
+      { snapshotName, retentionHours, autoDeleteAt }
+    );
+    return data.autoDeleteAt;
+  }
+
+  public static async cleanupExpiredSnapshots(
+    policy: SnapshotLifecyclePolicy,
+    config: CloudConfig
+  ): Promise<{
+    checkedCount: number;
+    deletedSnapshots: Array<{ name: string; reason: string }>;
+    skippedProtected: Array<{ name: string; reason: string }>;
+  }> {
+    if (config.mode === 'floci_simulation') {
+      return flociSimulator.cleanupExpiredSnapshots(policy, config);
+    }
+
+    const start = performance.now();
+    const data = await postJson<{
+      success: boolean;
+      checkedCount: number;
+      deletedSnapshots: Array<{ name: string; reason: string }>;
+      skippedProtected: Array<{ name: string; reason: string }>;
+    }>('/api/lightsail/snapshots/cleanup', { config });
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'SnapshotLifecycleCleanup',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { policy },
+      responsePayload: {
+        checkedCount: data.checkedCount,
+        deletedCount: data.deletedSnapshots.length,
+        deletedSnapshots: data.deletedSnapshots,
+        skippedProtected: data.skippedProtected,
+      },
+      status: 200,
+      latencyMs: Math.round(performance.now() - start),
+      success: true,
+    });
+
+    return {
+      checkedCount: data.checkedCount,
+      deletedSnapshots: data.deletedSnapshots || [],
+      skippedProtected: data.skippedProtected || [],
+    };
+  }
+
+  /**
    * Stop instance without deleting it or creating a snapshot
    */
   public static async stopInstance(instanceName: string, config: CloudConfig): Promise<LightsailInstance | null> {
@@ -318,18 +562,47 @@ export class ApiBridge {
   }
 
   /**
-   * Feature 1: 暂时删除实例 (Save Snapshot -> Delete Instance)
+   * Feature 1: 休眠并释放实例 (Step 1: 保存防火墙配置 -> Step 2: 创建系统快照 -> Step 3: 暂时删除计算实例)
    */
   public static async hibernateInstance(
     instanceName: string,
     snapshotName: string,
     config: CloudConfig,
-    onProgress?: (step: OperationStep) => void
-  ): Promise<{ snapshot?: LightsailSnapshot; success: boolean }> {
+    onProgress?: (step: OperationStep) => void,
+    options?: {
+      retentionHours?: number | null;
+      customFirewallRules?: FirewallPortRule[];
+    }
+  ): Promise<{ snapshot?: LightsailSnapshot; firewallRules: FirewallPortRule[]; success: boolean }> {
+    // STEP 1/3: Extract & Save Firewall Configuration
+    onProgress?.({
+      id: 'save_firewall',
+      title: '1/3 提取并备份实例防火墙配置',
+      description: `正在通过 GetInstancePortStates 提取实例 ${instanceName} 的开放端口与 CIDR 规则...`,
+      status: 'running',
+    });
+
+    const fwResult = await ApiBridge.extractFirewallRules(
+      instanceName,
+      snapshotName,
+      config,
+      options?.customFirewallRules
+    );
+
+    onProgress?.({
+      id: 'save_firewall',
+      title: '1/3 防火墙配置已提取并备份',
+      description: `已安全保存 ${fwResult.rules.length} 条防火墙端口规则 (${fwResult.rules
+        .map((r) => `${r.protocol.toUpperCase()}:${r.fromPort}`)
+        .join(', ')})`,
+      status: 'completed',
+    });
+
     if (config.mode === 'real_cloud') {
+      // STEP 2/3: Create AWS Snapshot & Wait Available
       onProgress?.({
         id: 'snap_create',
-        title: '1/2 发起创建 AWS 系统快照',
+        title: '2/3 发起创建 AWS 系统快照',
         description: `正在向 AWS Lightsail 发起快照创建请求 (${snapshotName})...`,
         status: 'running',
       });
@@ -340,9 +613,16 @@ export class ApiBridge {
         snapshotName: string;
         state: string;
         sizeInGb?: number;
+        autoDeleteAt?: string | null;
         latencyMs: number;
         endpoint: string;
-      }>('/api/lightsail/snapshot/create', { instanceName, snapshotName, config });
+      }>('/api/lightsail/snapshot/create', {
+        instanceName,
+        snapshotName,
+        retentionHours: options?.retentionHours,
+        firewallRules: fwResult.rules,
+        config,
+      });
 
       flociSimulator.recordExternalLog({
         service: 'AWS_LIGHTSAIL',
@@ -351,8 +631,16 @@ export class ApiBridge {
           ? 'GetInstanceSnapshot (Reuse Existing)'
           : 'CreateInstanceSnapshot (Real Cloud)',
         endpoint: createRes.endpoint,
-        requestPayload: { instanceName, instanceSnapshotName: snapshotName },
-        responsePayload: { state: createRes.state, alreadyExists: createRes.alreadyExists },
+        requestPayload: {
+          instanceName,
+          instanceSnapshotName: snapshotName,
+          preservedFirewallRulesCount: fwResult.rules.length,
+        },
+        responsePayload: {
+          state: createRes.state,
+          alreadyExists: createRes.alreadyExists,
+          autoDeleteAt: createRes.autoDeleteAt,
+        },
         status: 200,
         latencyMs: createRes.latencyMs,
         success: true,
@@ -366,7 +654,7 @@ export class ApiBridge {
         const elapsedSec = Math.round((Date.now() - pollStart) / 1000);
         onProgress?.({
           id: 'snap_wait',
-          title: '1/2 等待 AWS 快照写入完成',
+          title: '2/3 等待 AWS 快照写入完成',
           description: `AWS 正在备份实例磁盘至快照 ${snapshotName}（当前状态: ${snapState}，已等待 ${elapsedSec} 秒，通常需 30~90 秒）...`,
           status: 'running',
         });
@@ -392,10 +680,11 @@ export class ApiBridge {
         throw new Error(`等待快照 ${snapshotName} 就绪超时，为确保数据安全未删除实例`);
       }
 
+      // STEP 3/3: Delete Compute Instance
       onProgress?.({
         id: 'delete_compute',
-        title: '2/2 快照已就绪，正在释放计算实例',
-        description: `快照 ${snapshotName} (${snapSize} GB) 已安全入库！正在调用 DeleteInstance 暂时删除实例以停止计费...`,
+        title: '3/3 快照与防火墙已就绪，正在释放计算实例',
+        description: `快照 ${snapshotName} (${snapSize} GB) 及 ${fwResult.rules.length} 条防火墙规则已归档！正在调用 DeleteInstance 暂时删除实例以停止计费...`,
         status: 'running',
       });
 
@@ -412,7 +701,11 @@ export class ApiBridge {
         action: 'DeleteInstance (Real Cloud)',
         endpoint: delRes.endpoint,
         requestPayload: { instanceName, forceDeleteAddOns: true },
-        responsePayload: { deleted: true, preservedSnapshot: snapshotName },
+        responsePayload: {
+          deleted: true,
+          preservedSnapshot: snapshotName,
+          preservedFirewallRules: fwResult.rules.length,
+        },
         status: 200,
         latencyMs: delRes.latencyMs,
         success: true,
@@ -421,15 +714,15 @@ export class ApiBridge {
       onProgress?.({
         id: 'delete_compute',
         title: '实例已安全休眠并释放',
-        description: `计算实例 ${instanceName} 已从 AWS 删除停止计费，快照 ${snapshotName} 已保留，随时可一键唤醒！`,
+        description: `计算实例 ${instanceName} 已从 AWS 删除停止计费，防火墙规则 (${fwResult.rules.length} 条) 与快照 ${snapshotName} 已完整保留！`,
         status: 'completed',
       });
-      return { success: true };
+      return { firewallRules: fwResult.rules, success: true };
     }
 
     onProgress?.({
       id: 'snap_create',
-      title: '创建实例系统快照',
+      title: '2/3 创建实例系统快照',
       description: `正在向 AWS 发起创建快照请求: ${snapshotName}...`,
       status: 'running',
     });
@@ -438,20 +731,21 @@ export class ApiBridge {
       instanceName,
       snapshotName,
       config,
-      true
+      true,
+      options?.retentionHours
     );
 
     onProgress?.({
       id: 'snap_create',
-      title: '创建实例系统快照',
+      title: '2/3 创建实例系统快照',
       description: `快照 ${snapshotName} 状态已就绪 (Available, ${snapshot.sizeInGb} GB)`,
       status: 'completed',
     });
 
     onProgress?.({
       id: 'delete_compute',
-      title: '暂时删除 Lightsail 计算实例',
-      description: `确认快照已安全入库，正在释放实例计算资源以暂停计费...`,
+      title: '3/3 暂时删除 Lightsail 计算实例',
+      description: `确认防火墙配置与快照已安全入库，正在释放实例计算资源以暂停计费...`,
       status: 'running',
     });
 
@@ -460,15 +754,15 @@ export class ApiBridge {
     onProgress?.({
       id: 'delete_compute',
       title: '实例已安全休眠',
-      description: `计算实例已终止释放。系统快照保存在 AWS，随时可一键唤醒并自动同步 Cloudflare DNS！`,
+      description: `计算实例已终止释放。防火墙规则 (${fwResult.rules.length} 条) 与系统快照已保存，随时可一键唤醒并复原！`,
       status: 'completed',
     });
 
-    return { snapshot, success: true };
+    return { snapshot, firewallRules: fwResult.rules, success: true };
   }
 
   /**
-   * Feature 2: 从 Snapshot 快速恢复，并在启动时使用 Cloudflare DNS 将新 IP 写入记录
+   * Feature 2: 从 Snapshot 快速恢复 + 复原防火墙端口配置 + Cloudflare DNS 新 IP 同步
    */
   public static async restoreInstanceWithDns(
     instanceName: string,
@@ -482,30 +776,66 @@ export class ApiBridge {
       proxied: boolean;
     },
     config: CloudConfig,
-    onStepUpdate?: (stepIndex: number, step: OperationStep) => void
-  ): Promise<{ instance: LightsailInstance; dnsRecord?: CloudflareDnsRecord }> {
+    onStepUpdate?: (stepIndex: number, step: OperationStep) => void,
+    firewallConfig?: {
+      enabled: boolean;
+      rules?: FirewallPortRule[];
+    }
+  ): Promise<{
+    instance: LightsailInstance;
+    dnsRecord?: CloudflareDnsRecord;
+    restoredFirewallRules?: FirewallPortRule[];
+  }> {
+    const shouldRestoreFirewall = firewallConfig?.enabled !== false;
+
     if (config.mode === 'real_cloud') {
       onStepUpdate?.(0, {
         id: 'restore_instance',
         title: '从快照重建 Lightsail 实例',
-        description: `正在调用真实 AWS API 从快照 ${snapshotName} 恢复实例并同步 DNS...`,
+        description: `正在调用真实 AWS API 从快照 ${snapshotName} 重建实例并恢复防火墙与 DNS...`,
         status: 'running',
       });
-      const data = await postJson<{ instance: LightsailInstance; dnsRecord?: CloudflareDnsRecord }>(
-        '/api/lightsail/restore',
-        {
+      const data = await postJson<{
+        instance: LightsailInstance;
+        dnsRecord?: CloudflareDnsRecord;
+        firewallRestored?: boolean;
+        restoredFirewallRules?: FirewallPortRule[];
+      }>('/api/lightsail/restore', {
+        instanceName,
+        snapshotName,
+        availabilityZone,
+        bundleId,
+        restoreFirewall: shouldRestoreFirewall,
+        firewallRules: firewallConfig?.rules,
+        cloudflareConfig,
+        config,
+      });
+
+      flociSimulator.recordExternalLog({
+        service: 'AWS_LIGHTSAIL',
+        method: 'POST',
+        action: 'CreateInstancesFromSnapshot + PutInstancePublicPorts',
+        endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+        requestPayload: {
           instanceName,
           snapshotName,
-          availabilityZone,
           bundleId,
-          cloudflareConfig,
-          config,
-        }
-      );
+          restoreFirewall: shouldRestoreFirewall,
+        },
+        responsePayload: {
+          publicIpAddress: data.instance.publicIpAddress,
+          firewallRestored: data.firewallRestored,
+          restoredFirewallCount: data.restoredFirewallRules?.length || 0,
+        },
+        status: 200,
+        latencyMs: 1200,
+        success: true,
+      });
+
       onStepUpdate?.(0, {
         id: 'restore_instance',
         title: '从快照重建 Lightsail 实例',
-        description: `实例已在区域 ${data.instance.location.regionName} 重建`,
+        description: `实例已在区域 ${data.instance.location.regionName} 重建就绪`,
         status: 'completed',
       });
       onStepUpdate?.(1, {
@@ -515,19 +845,34 @@ export class ApiBridge {
         status: 'completed',
         detail: data.instance.publicIpAddress || undefined,
       });
+
+      const fwCount = data.restoredFirewallRules?.length || data.instance.firewallRules?.length || 0;
       onStepUpdate?.(2, {
+        id: 'restore_firewall',
+        title: shouldRestoreFirewall ? '防火墙端口配置已复原' : '跳过防火墙复原',
+        description: shouldRestoreFirewall
+          ? `已调用 PutInstancePublicPorts 复原 ${fwCount} 条端口规则 (${(
+              data.restoredFirewallRules ||
+              data.instance.firewallRules ||
+              []
+            )
+              .map((r) => `${r.protocol.toUpperCase()}:${r.fromPort}`)
+              .join(', ')})`
+          : '使用 AWS 默认安全组规则',
+        status: 'completed',
+        detail: shouldRestoreFirewall ? `${fwCount} 端口已开放` : undefined,
+      });
+
+      onStepUpdate?.(3, {
         id: 'cf_dns_update',
-        title: cloudflareConfig.enabled ? 'Cloudflare DNS 已同步更新' : '跳过 DNS 更新',
+        title: cloudflareConfig.enabled ? 'Cloudflare DNS 已同步更新' : '实例就绪（跳过 DNS 更新）',
         description: cloudflareConfig.enabled
           ? `域名 ${cloudflareConfig.domain} 已指向 ${data.instance.publicIpAddress}`
-          : '未开启 Cloudflare 同步',
+          : '未开启 Cloudflare 域名同步，实例已完全就绪',
         status: 'completed',
-      });
-      onStepUpdate?.(3, {
-        id: 'verify_ready',
-        title: '就绪检查与服务连接验证',
-        description: `真实云端实例已启动就绪！`,
-        status: 'completed',
+        detail: cloudflareConfig.enabled
+          ? `${cloudflareConfig.domain} -> ${data.instance.publicIpAddress}`
+          : undefined,
       });
       return data;
     }
@@ -561,7 +906,7 @@ export class ApiBridge {
       status: 'running',
     });
 
-    await new Promise((r) => setTimeout(r, config.flociSimulationSpeed === 'instant' ? 100 : 700));
+    await new Promise((r) => setTimeout(r, config.flociSimulationSpeed === 'instant' ? 100 : 500));
 
     if (!instance.publicIpAddress) {
       throw new Error('AWS 未能在超时时间内为该实例分配有效的 IPv4 公网地址');
@@ -575,9 +920,43 @@ export class ApiBridge {
       detail: instance.publicIpAddress,
     });
 
+    let restoredFirewallRules: FirewallPortRule[] = [];
+    if (shouldRestoreFirewall) {
+      onStepUpdate?.(2, {
+        id: 'restore_firewall',
+        title: '复原实例防火墙配置',
+        description: `正在调用 PutInstancePublicPorts 恢复保存的防火墙开放端口规则...`,
+        status: 'running',
+      });
+
+      restoredFirewallRules = await flociSimulator.restoreFirewallRules(
+        instanceName,
+        snapshotName,
+        config,
+        firewallConfig?.rules
+      );
+
+      onStepUpdate?.(2, {
+        id: 'restore_firewall',
+        title: '防火墙端口配置已复原',
+        description: `已恢复 ${restoredFirewallRules.length} 条规则 (${restoredFirewallRules
+          .map((r) => `${r.protocol.toUpperCase()}:${r.fromPort}`)
+          .join(', ')})`,
+        status: 'completed',
+        detail: `${restoredFirewallRules.length} 端口已开放`,
+      });
+    } else {
+      onStepUpdate?.(2, {
+        id: 'restore_firewall',
+        title: '跳过防火墙复原',
+        description: '保留 AWS 默认防火墙端口配置',
+        status: 'completed',
+      });
+    }
+
     let dnsRecord: CloudflareDnsRecord | undefined;
     if (cloudflareConfig.enabled && cloudflareConfig.domain) {
-      onStepUpdate?.(2, {
+      onStepUpdate?.(3, {
         id: 'cf_dns_update',
         title: '写入 Cloudflare DNS 记录',
         description: `正在通过 Cloudflare API 将 ${cloudflareConfig.domain} 的 A 记录指向 ${instance.publicIpAddress}...`,
@@ -592,7 +971,7 @@ export class ApiBridge {
         config
       );
 
-      onStepUpdate?.(2, {
+      onStepUpdate?.(3, {
         id: 'cf_dns_update',
         title: 'Cloudflare DNS 已同步更新',
         description: `域名 ${cloudflareConfig.domain} 已指向 ${instance.publicIpAddress} (${cloudflareConfig.proxied ? '开启 CDN 代理' : '仅 DNS 直连'})`,
@@ -600,22 +979,15 @@ export class ApiBridge {
         detail: `${cloudflareConfig.domain} -> ${instance.publicIpAddress}`,
       });
     } else {
-      onStepUpdate?.(2, {
+      onStepUpdate?.(3, {
         id: 'cf_dns_skip',
-        title: '跳过 DNS 更新',
-        description: '未配置 Cloudflare 绑定域名，保留原配置。',
+        title: '实例就绪（跳过 DNS 更新）',
+        description: '未配置 Cloudflare 绑定域名，实例与防火墙已就绪。',
         status: 'completed',
       });
     }
 
-    onStepUpdate?.(3, {
-      id: 'verify_ready',
-      title: '就绪检查与服务连接验证',
-      description: `实例已处于 Running 状态，SSH 端口 22 开放，DNS 全球节点广播中！`,
-      status: 'completed',
-    });
-
-    return { instance, dnsRecord };
+    return { instance, dnsRecord, restoredFirewallRules };
   }
 
   /**
@@ -801,4 +1173,172 @@ export class ApiBridge {
 
     return results;
   }
+
+  /**
+   * Persist Default or Per-Instance Cloudflare DNS Domain Name on Server
+   */
+  public static async saveDefaultDomain(
+    defaultDnsRecordName: string,
+    instanceName?: string
+  ): Promise<void> {
+    try {
+      await postJson('/api/config/domain', { defaultDnsRecordName, instanceName });
+    } catch {
+      // Ignore if in static/offline mode
+    }
+  }
+
+  /**
+   * Fetch Server-Side Background Tasks
+   */
+  public static async getBackgroundTasks(): Promise<BackgroundTask[]> {
+    try {
+      const res = await fetch('/api/lightsail/tasks');
+      if (res.ok) {
+        const data = await res.json();
+        return Array.isArray(data?.tasks) ? data.tasks : [];
+      }
+    } catch {}
+    return [];
+  }
+
+  /**
+   * Clear Completed / Failed Background Tasks
+   */
+  public static async clearCompletedTasks(): Promise<BackgroundTask[]> {
+    try {
+      const data = await postJson<{ tasks: BackgroundTask[] }>('/api/lightsail/tasks/clear', {});
+      return data.tasks || [];
+    } catch {}
+    return [];
+  }
+
+  /**
+   * Enqueue Non-Blocking Background Hibernate Task
+   */
+  public static async enqueueHibernateTask(
+    instanceName: string,
+    snapshotName: string,
+    config: CloudConfig,
+    options?: {
+      retentionHours?: number | null;
+      customFirewallRules?: FirewallPortRule[];
+    }
+  ): Promise<{ taskId: string; task: BackgroundTask }> {
+    const data = await postJson<{ success: boolean; taskId: string; task: BackgroundTask }>(
+      '/api/lightsail/tasks/hibernate',
+      {
+        instanceName,
+        snapshotName,
+        retentionHours: options?.retentionHours,
+        firewallRules: options?.customFirewallRules,
+        config,
+      }
+    );
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'EnqueueBackgroundHibernate',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName, snapshotName },
+      responsePayload: { taskId: data.taskId, status: data.task.status },
+      status: 200,
+      latencyMs: 35,
+      success: true,
+    });
+
+    return { taskId: data.taskId, task: data.task };
+  }
+
+  /**
+   * Enqueue Non-Blocking Background Restore Task
+   */
+  public static async enqueueRestoreTask(
+    instanceName: string,
+    snapshotName: string,
+    availabilityZone: string,
+    bundleId: string,
+    cloudflareConfig: {
+      enabled: boolean;
+      domain: string;
+      zoneId: string;
+      proxied: boolean;
+    },
+    config: CloudConfig,
+    firewallConfig?: {
+      enabled: boolean;
+      rules?: FirewallPortRule[];
+    }
+  ): Promise<{ taskId: string; task: BackgroundTask }> {
+    const data = await postJson<{ success: boolean; taskId: string; task: BackgroundTask }>(
+      '/api/lightsail/tasks/restore',
+      {
+        instanceName,
+        snapshotName,
+        availabilityZone,
+        bundleId,
+        restoreFirewall: firewallConfig?.enabled !== false,
+        firewallRules: firewallConfig?.rules,
+        cloudflareConfig,
+        config,
+      }
+    );
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'EnqueueBackgroundRestore',
+      endpoint: `lightsail.${config.awsRegion || 'ap-northeast-1'}.amazonaws.com/`,
+      requestPayload: { instanceName, snapshotName, bundleId, domain: cloudflareConfig.domain },
+      responsePayload: { taskId: data.taskId, status: data.task.status },
+      status: 200,
+      latencyMs: 40,
+      success: true,
+    });
+
+    return { taskId: data.taskId, task: data.task };
+  }
+
+  /**
+   * Manual Release / Force Delete Compute Instance (without waiting for snapshot creation)
+   */
+  public static async manualReleaseInstance(
+    instanceName: string,
+    backupFirewall: boolean,
+    config: CloudConfig
+  ): Promise<void> {
+    if (config.mode === 'floci_simulation') {
+      if (backupFirewall) {
+        await flociSimulator.extractFirewallRules(instanceName, undefined, config);
+      }
+      await flociSimulator.deleteInstance(instanceName, config, true);
+      return;
+    }
+
+    const start = performance.now();
+    const data = await postJson<{
+      success: boolean;
+      instanceName: string;
+      latencyMs: number;
+      endpoint: string;
+    }>('/api/lightsail/tasks/release', {
+      instanceName,
+      backupFirewall,
+      config,
+    });
+
+    flociSimulator.recordExternalLog({
+      service: 'AWS_LIGHTSAIL',
+      method: 'POST',
+      action: 'ManualReleaseInstance (DeleteInstance)',
+      endpoint: data.endpoint,
+      requestPayload: { instanceName, backupFirewall, forceDeleteAddOns: true },
+      responsePayload: { deleted: true },
+      status: 200,
+      latencyMs: data.latencyMs || Math.round(performance.now() - start),
+      success: true,
+    });
+  }
 }
+

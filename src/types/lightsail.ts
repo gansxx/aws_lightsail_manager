@@ -11,12 +11,31 @@ export type InstanceState =
   | 'terminated'
   | 'hibernated'; // Custom state indicating instance was safely deleted with preserved snapshot
 
+export interface FirewallPortRule {
+  fromPort: number;
+  toPort: number;
+  protocol: 'tcp' | 'udp' | 'all' | 'icmp' | 'icmpv6';
+  cidrs: string[];
+  ipv6Cidrs?: string[];
+  cidrListAliases?: string[];
+  commonName?: string;
+}
+
+export interface SnapshotLifecyclePolicy {
+  enabled: boolean;
+  defaultRetentionHours: number; // e.g. 24, 72, 168 (7d), 336 (14d), 720 (30d); 0 = keep forever
+  maxSnapshotsPerInstance: number; // e.g. 3; 0 = unlimited
+  protectLatestHibernatedSnapshot: boolean; // keep at least 1 snapshot for hibernated instances
+  lastCleanupTime?: string;
+  deletedCountTotal?: number;
+}
+
 export interface LightsailInstance {
   name: string;
   arn: string;
   blueprintId: string;
   blueprintName: string;
-  bundleId: string; // e.g. nano_2_0, micro_2_0, small_2_0
+  bundleId: string; // e.g. nano_2_0, micro_2_0, small_2_0, micro_3_0
   bundleName: string; // e.g. $3.50/mo (512MB RAM, 1 vCPU, 20GB SSD)
   ramGb: number;
   cpuCount: number;
@@ -33,6 +52,10 @@ export interface LightsailInstance {
   createdAt: string;
   tags?: { key: string; value: string }[];
   keyPairName?: string;
+
+  // Firewall configuration (extracted live or preserved before hibernation)
+  firewallRules?: FirewallPortRule[];
+  firewallExtractedAt?: string;
   
   // Hibernation & Cloudflare binding metadata
   lastSnapshotName?: string;
@@ -74,11 +97,15 @@ export interface LightsailSnapshot {
   progress?: string;
   createdAt: string;
   isAutoHibernateSnapshot?: boolean;
+  // Snapshot Lifecycle / Auto-Delete Metadata
+  autoDeleteAt?: string | null; // ISO timestamp when snapshot should be automatically deleted (null = never)
+  isProtectedHibernatedBase?: boolean; // True if this is the active boot snapshot of a currently hibernated instance
   preservedConfig?: {
     blueprintId: string;
     bundleId: string;
     availabilityZone: string;
     cloudflareDomain?: string;
+    firewallRules?: FirewallPortRule[];
     tags?: { key: string; value: string }[];
   };
 }
@@ -209,5 +236,25 @@ export interface GitHubUpdateInfo {
   } | null;
   checkedAt: string;
 }
+export type BackgroundTaskType = 'hibernate' | 'restore' | 'manual_release';
 
-
+export interface BackgroundTask {
+  id: string;
+  type: BackgroundTaskType;
+  title: string;
+  instanceName: string;
+  snapshotName?: string;
+  status: 'running' | 'completed' | 'failed';
+  progressPercent: number;
+  currentStepTitle: string;
+  steps: OperationStep[];
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: string;
+  result?: {
+    publicIpAddress?: string | null;
+    domain?: string;
+    firewallRulesCount?: number;
+  };
+}

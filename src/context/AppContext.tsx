@@ -13,6 +13,9 @@ import {
   EnvSecretStatus,
   CredentialTestReport,
   GitHubUpdateInfo,
+  FirewallPortRule,
+  SnapshotLifecyclePolicy,
+  BackgroundTask,
 } from '../types/lightsail';
 import { ApiBridge } from '../services/apiBridge';
 import { flociSimulator } from '../services/flociSimulator';
@@ -42,6 +45,11 @@ interface AppContextType {
   instanceActionLoading: string | null;
   githubUpdateInfo: GitHubUpdateInfo | null;
   checkingGitHubUpdate: boolean;
+  snapshotLifecycle: SnapshotLifecyclePolicy;
+  cleaningSnapshots: boolean;
+  backgroundTasks: BackgroundTask[];
+  taskDrawerOpen: boolean;
+  setTaskDrawerOpen: (open: boolean) => void;
 
   // Modal controls
   hibernateModal: {
@@ -81,7 +89,8 @@ interface AppContextType {
   executeHibernate: (
     instanceName: string,
     snapshotName: string,
-    onStepUpdate: (step: OperationStep) => void
+    onStepUpdate: (step: OperationStep) => void,
+    options?: { retentionHours?: number | null; customFirewallRules?: FirewallPortRule[] }
   ) => Promise<boolean>;
   executeRestore: (
     instanceName: string,
@@ -89,11 +98,45 @@ interface AppContextType {
     zone: string,
     bundleId: string,
     cfConfig: { enabled: boolean; domain: string; zoneId: string; proxied: boolean },
-    onStepUpdate: (index: number, step: OperationStep) => void
+    onStepUpdate: (index: number, step: OperationStep) => void,
+    firewallConfig?: { enabled: boolean; rules?: FirewallPortRule[] }
   ) => Promise<boolean>;
   executeManualSyncDns: (domain: string, ip: string, zoneId: string, proxied: boolean) => Promise<void>;
+  updateInstanceDomain: (domain: string, instanceName?: string) => Promise<void>;
   executeStopInstance: (instance: LightsailInstance) => Promise<void>;
   executeStartInstance: (instance: LightsailInstance) => Promise<void>;
+  executeManualReleaseInstance: (instanceName: string, backupFirewall?: boolean) => Promise<void>;
+  enqueueBackgroundHibernate: (
+    instanceName: string,
+    snapshotName: string,
+    options?: { retentionHours?: number | null; customFirewallRules?: FirewallPortRule[] }
+  ) => Promise<BackgroundTask>;
+  enqueueBackgroundRestore: (
+    instanceName: string,
+    snapshotName: string,
+    zone: string,
+    bundleId: string,
+    cfConfig: { enabled: boolean; domain: string; zoneId: string; proxied: boolean },
+    firewallConfig?: { enabled: boolean; rules?: FirewallPortRule[] }
+  ) => Promise<BackgroundTask>;
+  clearCompletedBackgroundTasks: () => Promise<void>;
+  extractInstanceFirewallRules: (instanceName: string, snapshotName?: string) => Promise<FirewallPortRule[]>;
+  saveInstanceFirewallRules: (
+    instanceName: string,
+    snapshotName: string | undefined,
+    rules: FirewallPortRule[],
+    applyToRunningInstance?: boolean
+  ) => Promise<FirewallPortRule[]>;
+  updateSnapshotLifecycle: (
+    policy: Partial<SnapshotLifecyclePolicy>,
+    applyToExistingSnapshots?: boolean
+  ) => Promise<void>;
+  setSnapshotRetention: (
+    snapshotName: string,
+    retentionHours?: number | null,
+    autoDeleteAt?: string | null
+  ) => Promise<void>;
+  runSnapshotCleanup: () => Promise<void>;
   testCurrentCredentials: (overrideConfig?: CloudConfig) => Promise<CredentialTestReport | null>;
   refreshSecretStatus: () => Promise<void>;
   checkGitHubUpdate: (overrideRepo?: string, silent?: boolean) => Promise<GitHubUpdateInfo | null>;
@@ -123,6 +166,13 @@ const DEFAULT_CONFIG: CloudConfig = {
   githubRepo: 'gansxx/aws_lightsail_manager',
 };
 
+const DEFAULT_LIFECYCLE: SnapshotLifecyclePolicy = {
+  enabled: true,
+  defaultRetentionHours: 168,
+  maxSnapshotsPerInstance: 3,
+  protectLatestHibernatedSnapshot: true,
+};
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [instances, setInstances] = useState<LightsailInstance[]>([]);
   const [snapshots, setSnapshots] = useState<LightsailSnapshot[]>([]);
@@ -140,6 +190,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [githubUpdateInfo, setGithubUpdateInfo] = useState<GitHubUpdateInfo | null>(null);
   const [checkingGitHubUpdate, setCheckingGitHubUpdate] = useState<boolean>(false);
   const [secretCheckDone, setSecretCheckDone] = useState<boolean>(false);
+  const [snapshotLifecycle, setSnapshotLifecycle] = useState<SnapshotLifecyclePolicy>(DEFAULT_LIFECYCLE);
+  const [cleaningSnapshots, setCleaningSnapshots] = useState<boolean>(false);
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
+  const [taskDrawerOpen, setTaskDrawerOpen] = useState<boolean>(false);
+  const prevRunningTaskIdsRef = React.useRef<Set<string>>(new Set());
 
   // Modals
   const [hibernateModal, setHibernateModal] = useState<{ isOpen: boolean; instance: LightsailInstance | null }>({
@@ -166,15 +221,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const stored = localStorage.getItem('lightsail_cloud_config');
       const explicitMode = localStorage.getItem('lightsail_mode_explicit');
+      const customDomain = localStorage.getItem('lightsail_custom_domain');
       if (stored) {
         const parsed = JSON.parse(stored);
         return {
           ...DEFAULT_CONFIG,
           ...parsed,
+          defaultDnsRecordName: customDomain || parsed.defaultDnsRecordName || DEFAULT_CONFIG.defaultDnsRecordName,
           mode: explicitMode === 'floci_simulation' ? 'floci_simulation' : 'real_cloud',
         };
       }
-      return DEFAULT_CONFIG;
+      return {
+        ...DEFAULT_CONFIG,
+        defaultDnsRecordName: customDomain || DEFAULT_CONFIG.defaultDnsRecordName,
+      };
     } catch {
       return DEFAULT_CONFIG;
     }
@@ -198,6 +258,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const updateConfig = (newConfig: Partial<CloudConfig>) => {
+    const cleanDomain =
+      newConfig.defaultDnsRecordName !== undefined
+        ? newConfig.defaultDnsRecordName.trim()
+        : undefined;
+
+    if (cleanDomain) {
+      try {
+        localStorage.setItem('lightsail_custom_domain', cleanDomain);
+      } catch {}
+      ApiBridge.saveDefaultDomain(cleanDomain);
+    }
+
     setConfig((prev) => {
       const hasCustomRealKey = Boolean(
         (newConfig.awsAccessKeyId && newConfig.awsAccessKeyId.trim()) ||
@@ -211,6 +283,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated: CloudConfig = {
         ...prev,
         ...newConfig,
+        defaultDnsRecordName: cleanDomain || prev.defaultDnsRecordName,
         mode: nextMode,
       };
 
@@ -229,16 +302,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast('配置已更新', 'info');
   };
 
+  const updateInstanceDomain = async (domain: string, instanceName?: string) => {
+    const clean = domain.trim();
+    if (!clean) {
+      showToast('请输入有效的域名', 'warning');
+      return;
+    }
+    try {
+      localStorage.setItem('lightsail_custom_domain', clean);
+    } catch {}
+    await ApiBridge.saveDefaultDomain(clean, instanceName);
+    setConfig((prev) => {
+      const updated = { ...prev, defaultDnsRecordName: clean };
+      try {
+        localStorage.setItem('lightsail_cloud_config', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+    await refreshData();
+    showToast(`解析域名已更新为 ${clean}`, 'success');
+  };
+
   const refreshData = useCallback(async () => {
     setLoading(true);
     if (config.mode === 'real_cloud') {
       flociSimulator.clearSimulationStorage();
       const scheduleOverrides = schedulerService.getInstanceScheduleOverrides();
 
-      const [instResult, snapResult] = await Promise.allSettled([
+      const [instResult, snapResult, lifecycleResult] = await Promise.allSettled([
         ApiBridge.getInstances(config),
         ApiBridge.getSnapshots(config),
+        ApiBridge.getSnapshotLifecyclePolicy(),
       ]);
+
+      if (lifecycleResult.status === 'fulfilled' && lifecycleResult.value) {
+        setSnapshotLifecycle(lifecycleResult.value);
+      }
 
       if (instResult.status === 'fulfilled') {
         const merged = instResult.value.map((inst) => ({
@@ -268,10 +367,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
-      const insts = await ApiBridge.getInstances(config);
-      const snaps = await ApiBridge.getSnapshots(config);
+      const [insts, snaps, policy] = await Promise.all([
+        ApiBridge.getInstances(config),
+        ApiBridge.getSnapshots(config),
+        ApiBridge.getSnapshotLifecyclePolicy(),
+      ]);
       setInstances(insts);
       setSnapshots(snaps);
+      setSnapshotLifecycle(policy);
     } catch (e: any) {
       showToast(e.message || '获取数据失败', 'error');
     } finally {
@@ -285,6 +388,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setEnvSecretStatus(status);
 
       const explicitMode = localStorage.getItem('lightsail_mode_explicit');
+      const customSavedDomain = localStorage.getItem('lightsail_custom_domain');
       if (
         status.awsAccessKeyId.configured &&
         status.awsSecretAccessKey.configured &&
@@ -292,11 +396,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ) {
         purgeSimulationState();
         setConfig((prev) => {
+          const resolvedDomain =
+            customSavedDomain ||
+            prev.defaultDnsRecordName ||
+            status.cloudflareRecordName ||
+            'test.selfgo.asia';
           const updated: CloudConfig = {
             ...prev,
             mode: 'real_cloud',
             awsRegion: status.awsRegion || prev.awsRegion,
-            defaultDnsRecordName: status.cloudflareRecordName || prev.defaultDnsRecordName,
+            defaultDnsRecordName: resolvedDomain,
           };
           try {
             localStorage.setItem('lightsail_cloud_config', JSON.stringify(updated));
@@ -336,16 +445,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [secretCheckDone, refreshData]);
 
-  // Execute Hibernate (Save snapshot -> Delete instance)
+  // Execute Hibernate (Step 1: Save Firewall -> Step 2: Create Snapshot -> Step 3: Delete Instance)
   const executeHibernate = async (
     instanceName: string,
     snapshotName: string,
-    onStepUpdate: (step: OperationStep) => void
+    onStepUpdate: (step: OperationStep) => void,
+    options?: { retentionHours?: number | null; customFirewallRules?: FirewallPortRule[] }
   ): Promise<boolean> => {
     try {
-      await ApiBridge.hibernateInstance(instanceName, snapshotName, config, onStepUpdate);
+      const res = await ApiBridge.hibernateInstance(
+        instanceName,
+        snapshotName,
+        config,
+        onStepUpdate,
+        options
+      );
       await refreshData();
-      showToast(`实例 ${instanceName} 已成功休眠，快照保存在 AWS`, 'success');
+      showToast(
+        `实例 ${instanceName} 已安全休眠！已备份 ${res.firewallRules.length} 条防火墙规则并生成快照 ${snapshotName}`,
+        'success'
+      );
       return true;
     } catch (e: any) {
       showToast(`休眠失败: ${e.message}`, 'error');
@@ -353,14 +472,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  // Execute Restore from Snapshot + Cloudflare DNS auto update
+  // Execute Restore from Snapshot + Firewall Restore + Cloudflare DNS auto update
   const executeRestore = async (
     instanceName: string,
     snapshotName: string,
     zone: string,
     bundleId: string,
     cfConfig: { enabled: boolean; domain: string; zoneId: string; proxied: boolean },
-    onStepUpdate: (index: number, step: OperationStep) => void
+    onStepUpdate: (index: number, step: OperationStep) => void,
+    firewallConfig?: { enabled: boolean; rules?: FirewallPortRule[] }
   ): Promise<boolean> => {
     try {
       const res = await ApiBridge.restoreInstanceWithDns(
@@ -370,17 +490,362 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         bundleId,
         cfConfig,
         config,
-        onStepUpdate
+        onStepUpdate,
+        firewallConfig
       );
       await refreshData();
+      const fwCount = res.restoredFirewallRules?.length || res.instance.firewallRules?.length || 0;
       showToast(
-        `实例 ${res.instance.name} 已成功启动！新 IP: ${res.instance.publicIpAddress || '分配中'} 已同步至 Cloudflare`,
+        `实例 ${res.instance.name} 已恢复启动！新 IP ${res.instance.publicIpAddress || '已分配'}，已复原 ${fwCount} 条防火墙规则并同步 DNS`,
         'success'
       );
       return true;
     } catch (e: any) {
       showToast(`恢复失败: ${e.message}`, 'error');
       throw e;
+    }
+  };
+
+  // Poll server-side background tasks and refresh data when any running task finishes
+  const syncServerTasks = useCallback(async () => {
+    if (config.mode !== 'real_cloud') return;
+    const serverTasks = await ApiBridge.getBackgroundTasks();
+    setBackgroundTasks(serverTasks);
+
+    const prevRunning = prevRunningTaskIdsRef.current;
+    const currentRunning = new Set<string>();
+    let anyFinished = false;
+
+    for (const t of serverTasks) {
+      if (t.status === 'running') {
+        currentRunning.add(t.id);
+      } else if (prevRunning.has(t.id)) {
+        anyFinished = true;
+        if (t.status === 'completed') {
+          showToast(`后台任务已完成: ${t.title} (${t.currentStepTitle})`, 'success');
+        } else if (t.status === 'failed') {
+          showToast(`后台任务失败: ${t.title} - ${t.error || '未知错误'}`, 'error');
+        }
+      }
+    }
+
+    prevRunningTaskIdsRef.current = currentRunning;
+    if (anyFinished) {
+      refreshData();
+    }
+  }, [config.mode, refreshData, showToast]);
+
+  useEffect(() => {
+    if (!secretCheckDone) return;
+    syncServerTasks();
+    const hasRunning = backgroundTasks.some((t) => t.status === 'running');
+    const intervalMs = hasRunning ? 2500 : 8000;
+    const timer = setInterval(syncServerTasks, intervalMs);
+    return () => clearInterval(timer);
+  }, [secretCheckDone, backgroundTasks, syncServerTasks]);
+
+  // Enqueue Non-Blocking Background Hibernate
+  const enqueueBackgroundHibernate = async (
+    instanceName: string,
+    snapshotName: string,
+    options?: { retentionHours?: number | null; customFirewallRules?: FirewallPortRule[] }
+  ): Promise<BackgroundTask> => {
+    if (config.mode === 'floci_simulation') {
+      const nowIso = new Date().toISOString();
+      const simTask: BackgroundTask = {
+        id: `sim-hib-${Date.now()}`,
+        type: 'hibernate',
+        title: `后台休眠实例 ${instanceName}`,
+        instanceName,
+        snapshotName,
+        status: 'running',
+        progressPercent: 25,
+        currentStepTitle: '正在后台执行模拟休眠...',
+        steps: [
+          { id: '1', title: '1/3 提取并备份防火墙配置', description: '正在保存端口规则...', status: 'running' },
+          { id: '2', title: '2/3 创建系统快照', description: `快照 ${snapshotName}`, status: 'pending' },
+          { id: '3', title: '3/3 释放计算实例', description: '停止计算计费', status: 'pending' },
+        ],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      setBackgroundTasks((prev) => [simTask, ...prev]);
+      setTaskDrawerOpen(true);
+
+      (async () => {
+        try {
+          await ApiBridge.hibernateInstance(instanceName, snapshotName, config, undefined, options);
+          setBackgroundTasks((prev) =>
+            prev.map((t) =>
+              t.id === simTask.id
+                ? {
+                    ...t,
+                    status: 'completed',
+                    progressPercent: 100,
+                    currentStepTitle: `休眠完成 (${snapshotName})`,
+                    completedAt: new Date().toISOString(),
+                    steps: t.steps.map((s) => ({ ...s, status: 'completed' })),
+                  }
+                : t
+            )
+          );
+          await refreshData();
+          showToast(`后台休眠完成: ${instanceName}`, 'success');
+        } catch (err: any) {
+          setBackgroundTasks((prev) =>
+            prev.map((t) =>
+              t.id === simTask.id
+                ? { ...t, status: 'failed', error: err.message, currentStepTitle: `失败: ${err.message}` }
+                : t
+            )
+          );
+        }
+      })();
+
+      return simTask;
+    }
+
+    const { task } = await ApiBridge.enqueueHibernateTask(instanceName, snapshotName, config, options);
+    prevRunningTaskIdsRef.current.add(task.id);
+    setBackgroundTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+    setTaskDrawerOpen(true);
+    showToast(`已加入后台队列: 正在为 ${instanceName} 备份防火墙与快照，完成后将自动删除实例`, 'info');
+    return task;
+  };
+
+  // Enqueue Non-Blocking Background Restore
+  const enqueueBackgroundRestore = async (
+    instanceName: string,
+    snapshotName: string,
+    zone: string,
+    bundleId: string,
+    cfConfig: { enabled: boolean; domain: string; zoneId: string; proxied: boolean },
+    firewallConfig?: { enabled: boolean; rules?: FirewallPortRule[] }
+  ): Promise<BackgroundTask> => {
+    if (cfConfig.domain) {
+      try {
+        localStorage.setItem('lightsail_custom_domain', cfConfig.domain.trim());
+      } catch {}
+    }
+
+    if (config.mode === 'floci_simulation') {
+      const nowIso = new Date().toISOString();
+      const simTask: BackgroundTask = {
+        id: `sim-res-${Date.now()}`,
+        type: 'restore',
+        title: `后台恢复实例 ${instanceName}`,
+        instanceName,
+        snapshotName,
+        status: 'running',
+        progressPercent: 25,
+        currentStepTitle: '正在后台恢复实例与防火墙...',
+        steps: [
+          { id: '1', title: '1/4 从快照重建实例', description: snapshotName, status: 'running' },
+          { id: '2', title: '2/4 等待分配公网 IP', description: '等待网络栈就绪', status: 'pending' },
+          { id: '3', title: '3/4 复原防火墙端口规则', description: 'PutInstancePublicPorts', status: 'pending' },
+          { id: '4', title: '4/4 同步 Cloudflare DNS', description: cfConfig.domain, status: 'pending' },
+        ],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      setBackgroundTasks((prev) => [simTask, ...prev]);
+      setTaskDrawerOpen(true);
+
+      (async () => {
+        try {
+          const res = await ApiBridge.restoreInstanceWithDns(
+            instanceName,
+            snapshotName,
+            zone,
+            bundleId,
+            cfConfig,
+            config,
+            undefined,
+            firewallConfig
+          );
+          setBackgroundTasks((prev) =>
+            prev.map((t) =>
+              t.id === simTask.id
+                ? {
+                    ...t,
+                    status: 'completed',
+                    progressPercent: 100,
+                    currentStepTitle: `恢复完成 (${res.instance.publicIpAddress})`,
+                    completedAt: new Date().toISOString(),
+                    steps: t.steps.map((s) => ({ ...s, status: 'completed' })),
+                  }
+                : t
+            )
+          );
+          await refreshData();
+          showToast(`后台恢复完成: ${instanceName} (${res.instance.publicIpAddress})`, 'success');
+        } catch (err: any) {
+          setBackgroundTasks((prev) =>
+            prev.map((t) =>
+              t.id === simTask.id
+                ? { ...t, status: 'failed', error: err.message, currentStepTitle: `失败: ${err.message}` }
+                : t
+            )
+          );
+        }
+      })();
+
+      return simTask;
+    }
+
+    const { task } = await ApiBridge.enqueueRestoreTask(
+      instanceName,
+      snapshotName,
+      zone,
+      bundleId,
+      cfConfig,
+      config,
+      firewallConfig
+    );
+    prevRunningTaskIdsRef.current.add(task.id);
+    setBackgroundTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+    setTaskDrawerOpen(true);
+    showToast(`已加入后台队列: 正在从快照 ${snapshotName} 重建 ${instanceName}`, 'info');
+    return task;
+  };
+
+  // Manual Release Instance (DeleteInstance immediately without waiting for snapshot creation)
+  const executeManualReleaseInstance = async (instanceName: string, backupFirewall = true) => {
+    setInstanceActionLoading(instanceName);
+    try {
+      await ApiBridge.manualReleaseInstance(instanceName, backupFirewall, config);
+      await syncServerTasks();
+      await refreshData();
+      showToast(`实例 ${instanceName} 已手动释放（已从 AWS 删除停止计费）`, 'success');
+    } catch (e: any) {
+      showToast(`手动释放实例失败: ${e.message}`, 'error');
+      throw e;
+    } finally {
+      setInstanceActionLoading(null);
+    }
+  };
+
+  const clearCompletedBackgroundTasks = async () => {
+    if (config.mode === 'floci_simulation') {
+      setBackgroundTasks((prev) => prev.filter((t) => t.status === 'running'));
+      return;
+    }
+    const remaining = await ApiBridge.clearCompletedTasks();
+    setBackgroundTasks(remaining);
+  };
+
+  const extractInstanceFirewallRules = async (
+    instanceName: string,
+    snapshotName?: string
+  ): Promise<FirewallPortRule[]> => {
+    try {
+      const res = await ApiBridge.extractFirewallRules(instanceName, snapshotName, config);
+      await refreshData();
+      showToast(`已成功提取并保存 ${instanceName} 的 ${res.rules.length} 条防火墙规则`, 'success');
+      return res.rules;
+    } catch (e: any) {
+      showToast(`提取防火墙配置失败: ${e.message}`, 'error');
+      throw e;
+    }
+  };
+
+  const saveInstanceFirewallRules = async (
+    instanceName: string,
+    snapshotName: string | undefined,
+    rules: FirewallPortRule[],
+    applyToRunningInstance = false
+  ): Promise<FirewallPortRule[]> => {
+    try {
+      const saved = await ApiBridge.saveFirewallRules(
+        instanceName,
+        snapshotName,
+        rules,
+        applyToRunningInstance,
+        config
+      );
+      await refreshData();
+      showToast(
+        applyToRunningInstance
+          ? `已保存并应用 ${saved.length} 条防火墙规则至云端实例 ${instanceName}`
+          : `已保存 ${saved.length} 条防火墙预设规则（将在实例恢复时自动应用）`,
+        'success'
+      );
+      return saved;
+    } catch (e: any) {
+      showToast(`保存防火墙规则失败: ${e.message}`, 'error');
+      throw e;
+    }
+  };
+
+  const updateSnapshotLifecycle = async (
+    policyUpdate: Partial<SnapshotLifecyclePolicy>,
+    applyToExistingSnapshots = false
+  ) => {
+    try {
+      const updated = await ApiBridge.updateSnapshotLifecyclePolicy(
+        policyUpdate,
+        applyToExistingSnapshots,
+        config
+      );
+      setSnapshotLifecycle(updated);
+      await refreshData();
+      showToast(
+        applyToExistingSnapshots
+          ? '快照生命周期策略已保存并同步至现有快照'
+          : '快照生命周期策略已更新',
+        'success'
+      );
+    } catch (e: any) {
+      showToast(`更新快照生命周期策略失败: ${e.message}`, 'error');
+    }
+  };
+
+  const setSnapshotRetention = async (
+    snapshotName: string,
+    retentionHours?: number | null,
+    autoDeleteAt?: string | null
+  ) => {
+    try {
+      const resolved = await ApiBridge.setSnapshotRetention(
+        snapshotName,
+        retentionHours,
+        autoDeleteAt,
+        config
+      );
+      await refreshData();
+      showToast(
+        resolved
+          ? `已设置快照 ${snapshotName} 自动删除时间: ${new Date(resolved).toLocaleString('zh-CN')}`
+          : `快照 ${snapshotName} 已设置为永久保留`,
+        'info'
+      );
+    } catch (e: any) {
+      showToast(`设置快照保留时间失败: ${e.message}`, 'error');
+    }
+  };
+
+  const runSnapshotCleanup = async () => {
+    setCleaningSnapshots(true);
+    try {
+      const res = await ApiBridge.cleanupExpiredSnapshots(snapshotLifecycle, config);
+      await refreshData();
+      if (res.deletedSnapshots.length > 0) {
+        showToast(
+          `生命周期清理完成: 已删除 ${res.deletedSnapshots.length} 个过期快照`,
+          'success'
+        );
+      } else if (res.skippedProtected.length > 0) {
+        showToast(
+          `检查完成 (共 ${res.checkedCount} 个): ${res.skippedProtected.length} 个快照因属于休眠实例唯一基础镜像而受保护保留`,
+          'info'
+        );
+      } else {
+        showToast(`生命周期检查完成 (共 ${res.checkedCount} 个快照)，当前暂无需要删除的过期快照`, 'info');
+      }
+    } catch (e: any) {
+      showToast(`执行过期快照清理失败: ${e.message}`, 'error');
+    } finally {
+      setCleaningSnapshots(false);
     }
   };
 
@@ -530,17 +995,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const triggerTestHibernateSchedule = async (inst: LightsailInstance) => {
-    showToast(`正在测试执行 ${inst.name} 的定时自动休眠任务...`, 'info');
+    showToast(`正在测试执行 ${inst.name} 的定时自动休眠任务（保存防火墙 -> 创建快照 -> 删除实例）...`, 'info');
     await schedulerService.executeAutoHibernate(inst, config);
     await refreshData();
     showToast(`定时休眠测试执行完成，请查看任务历史与快照列表`, 'success');
   };
 
   const triggerTestStartSchedule = async (inst: LightsailInstance) => {
-    showToast(`正在测试执行 ${inst.name} 的定时自动唤醒任务...`, 'info');
+    showToast(`正在测试执行 ${inst.name} 的定时自动唤醒任务（恢复快照 -> 复原防火墙 -> 同步 DNS）...`, 'info');
     await schedulerService.executeAutoStart(inst, config);
     await refreshData();
-    showToast(`定时唤醒测试执行完成，实例已恢复并更新 Cloudflare DNS`, 'success');
+    showToast(`定时唤醒测试执行完成，实例已恢复并更新防火墙与 Cloudflare DNS`, 'success');
   };
 
   const clearApiLogs = () => {
@@ -573,6 +1038,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         instanceActionLoading,
         githubUpdateInfo,
         checkingGitHubUpdate,
+        snapshotLifecycle,
+        cleaningSnapshots,
+        backgroundTasks,
+        taskDrawerOpen,
+        setTaskDrawerOpen,
         hibernateModal,
         restoreModal,
         scheduleModal,
@@ -595,8 +1065,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         executeHibernate,
         executeRestore,
         executeManualSyncDns,
+        updateInstanceDomain,
         executeStopInstance,
         executeStartInstance,
+        executeManualReleaseInstance,
+        enqueueBackgroundHibernate,
+        enqueueBackgroundRestore,
+        clearCompletedBackgroundTasks,
+        extractInstanceFirewallRules,
+        saveInstanceFirewallRules,
+        updateSnapshotLifecycle,
+        setSnapshotRetention,
+        runSnapshotCleanup,
         testCurrentCredentials,
         refreshSecretStatus,
         checkGitHubUpdate,
